@@ -39,7 +39,6 @@ from senpai_agent.delegation import (
     configure_delegation,
     record_delegated_task_result,
 )
-from senpai_agent.github.code_review import DEFAULT_MAX_BLOCKING_REVIEW_ROUNDS
 from senpai_agent.inbox import (
     DeliveryState,
     InboxTurn,
@@ -259,7 +258,6 @@ class RunnerConfig:
     llm_num_retries: int = 5
     inbox_max_stalled_attempts: int = DEFAULT_INBOX_MAX_STALLED_ATTEMPTS
     inbox_max_recovery_generations: int = DEFAULT_INBOX_MAX_RECOVERY_GENERATIONS
-    max_blocking_review_rounds: int = DEFAULT_MAX_BLOCKING_REVIEW_ROUNDS
     child: bool = False
     delegation_root_state_dir: Path | None = None
     delegation_tree_id: str | None = None
@@ -780,17 +778,6 @@ def resolve_config(
             "inbox recovery budget requires a positive attempt limit and a "
             "non-negative recovery-generation limit"
         )
-    try:
-        max_blocking_review_rounds = int(
-            env.get(
-                "SENPAI_MAX_BLOCKING_REVIEW_ROUNDS",
-                str(DEFAULT_MAX_BLOCKING_REVIEW_ROUNDS),
-            )
-        )
-    except ValueError as error:
-        raise RuntimeError("SENPAI_MAX_BLOCKING_REVIEW_ROUNDS must be an integer") from error
-    if max_blocking_review_rounds < 1:
-        raise RuntimeError("SENPAI_MAX_BLOCKING_REVIEW_ROUNDS must be at least 1")
     wandb_entity = env.get("WANDB_ENTITY", "").strip() or None
     wandb_project = env.get("WANDB_PROJECT", "").strip() or None
     delegation_root_value = env.get("SENPAI_DELEGATION_ROOT_STATE_DIR")
@@ -1052,7 +1039,6 @@ def resolve_config(
         llm_num_retries=llm_num_retries,
         inbox_max_stalled_attempts=inbox_max_stalled_attempts,
         inbox_max_recovery_generations=inbox_max_recovery_generations,
-        max_blocking_review_rounds=max_blocking_review_rounds,
         child=args.child,
         delegation_root_state_dir=delegation_root_state_dir,
         delegation_tree_id=delegation_tree_id,

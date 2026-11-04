@@ -54,33 +54,6 @@ REJECTED = code_review.CodeQualityVerdict(
     approved=False, review_summary="Unnecessary complexity.", findings=[FINDING],
     notes=[],
 )
-TOOLING_FINDING = code_review.ReviewFinding(
-    path="tools/sass.py", finding="Exit with a non-zero status when the census fails.",
-)
-SAFETY_FINDING = code_review.ReviewFinding(
-    path="tools/sass.py", finding="Remove the hard-coded API token.", safety=True,
-)
-
-
-def rejected_review_comment(index: int) -> dict:
-    return comment(
-        100 + index,
-        f"<!-- senpai-merge-review:review-{index} -->\n\n**Supervisor**\n\n---\n\n"
-        "**Senpai Supervisor — merge review**\n\n**Verdict: Rejected**\n\n"
-        f"Round {index} findings.",
-    )
-
-
-def rejecting(*findings, summary="Unnecessary complexity."):
-    verdict = code_review.CodeQualityVerdict(
-        approved=False, review_summary=summary, findings=list(findings), notes=[],
-    )
-
-    def review(_prompt, _config, *, response_schema, on_structured_result):
-        on_structured_result(verdict)
-        return 0
-
-    return review
 NOTE = "README.md: The experiment notes could be shorter."
 ADVISOR_HISTORY_SENTINEL = "Advisor-only history: the experiment improved the held-out metric."
 
@@ -425,46 +398,18 @@ def test_non_blocking_notes_merge_and_are_published_with_the_approval(
         )
 
 
-def test_findings_outside_the_deliverable_become_notes_and_the_merge_proceeds(
-    merge_case, monkeypatch,
-):
-    """About 40 of 46 rejections in one campaign were on lane tooling, README
-    wording or generated copies rather than the submitted artefact."""
+def test_review_must_be_complete_and_findings_name_their_file(merge_case, monkeypatch):
+    """In one campaign the reviewer found one class of problem per round, so a
+    PR went through twelve rejections with its deliverable unchanged."""
 
-    merge_case.action = merge_case.action.model_copy(
-        update={"deliverable_paths": ("model.py", "docs/*.md")},
-    )
     prompts = []
 
     def review(prompt, _config, *, response_schema, on_structured_result):
         prompts.append(prompt)
-        on_structured_result(code_review.CodeQualityVerdict(
-            approved=False, review_summary="Tooling needs work.",
-            findings=[TOOLING_FINDING], notes=[NOTE],
-        ))
+        on_structured_result(REJECTED)
         return 0
 
     monkeypatch.setattr(runner, "run_openhands", review)
-
-    result = execute(merge_case)
-
-    assert result["state"] == "experiment_merged"
-    assert merge_case.fake.pr["merged"] is True
-    posted = merge_case.fake.comments[-1]["body"]
-    assert "**Verdict: Approved**" in posted
-    assert "**Blocking findings**" not in posted
-    assert f"- Outside the deliverable: tools/sass.py: {TOOLING_FINDING.finding}" in posted
-    assert f"- {NOTE}" in posted
-    assert "outside the declared deliverable" in posted
-    assert "## Deliverable\n\n- `model.py`\n- `docs/*.md`" in prompts[0]
-    assert "Give every finding the repository path it concerns" in prompts[0]
-
-
-def test_findings_on_the_deliverable_still_block(merge_case, monkeypatch):
-    merge_case.action = merge_case.action.model_copy(
-        update={"deliverable_paths": ("model.py",)},
-    )
-    monkeypatch.setattr(runner, "run_openhands", rejecting(FINDING, TOOLING_FINDING))
 
     result = execute(merge_case)
 
@@ -473,57 +418,10 @@ def test_findings_on_the_deliverable_still_block(merge_case, monkeypatch):
     posted = merge_case.fake.comments[-1]["body"]
     assert "**Verdict: Rejected**" in posted
     assert f"- model.py: {FINDING_TEXT}" in posted
-    assert f"- Outside the deliverable: tools/sass.py: {TOOLING_FINDING.finding}" in posted
-
-
-@pytest.mark.parametrize(
-    ("prior_rounds", "limit", "merged"),
-    [(1, 2, False), (2, 2, True), (3, 2, True), (2, 3, False)],
-    ids=["below-cap", "at-cap", "above-cap", "raised-cap"],
-)
-def test_blocking_review_rounds_are_capped_per_pr(
-    merge_case, monkeypatch, prior_rounds, limit, merged,
-):
-    """One PR took 14 revisions and 17 hours after its science was accepted."""
-
-    merge_case.fake.comments.extend(
-        rejected_review_comment(index) for index in range(1, prior_rounds + 1)
-    )
-    merge_case.config = replace(merge_case.config, max_blocking_review_rounds=limit)
-    monkeypatch.setattr(runner, "run_openhands", rejecting(FINDING))
-
-    result = execute(merge_case)
-
-    posted = merge_case.fake.comments[-1]["body"]
-    assert merge_case.fake.pr["merged"] is merged
-    if merged:
-        assert result["state"] == "experiment_merged"
-        assert "**Verdict: Approved**" in posted
-        assert f"{prior_rounds} blocking review rounds, the configured limit of {limit}" in posted
-        assert f"- After {prior_rounds} blocking rounds: model.py: {FINDING_TEXT}" in posted
-    else:
-        assert result["state"] == "merge_blocked"
-        assert "**Verdict: Rejected**" in posted
-        assert f"- model.py: {FINDING_TEXT}" in posted
-
-
-def test_safety_findings_block_regardless_of_scope_and_rounds(merge_case, monkeypatch):
-    merge_case.fake.comments.extend(rejected_review_comment(index) for index in (1, 2))
-    merge_case.action = merge_case.action.model_copy(
-        update={"deliverable_paths": ("model.py",)},
-    )
-    monkeypatch.setattr(runner, "run_openhands", rejecting(SAFETY_FINDING))
-
-    result = execute(merge_case)
-
-    assert result["state"] == "merge_blocked"
-    assert merge_case.fake.pr["merged"] is False
-    assert f"- tools/sass.py: {SAFETY_FINDING.finding}" in merge_case.fake.comments[-1]["body"]
-
-
-def test_default_round_cap_is_two():
-    assert runner.DEFAULT_MAX_BLOCKING_REVIEW_ROUNDS == 2
-    assert MergeExperimentAction.model_fields["deliverable_paths"].default == ()
+    assert "This review must be complete." in prompts[0]
+    assert "each with the repository path it concerns" in prompts[0]
+    assert "confirm that each earlier finding is resolved" in prompts[0]
+    assert "Deliverable" not in prompts[0]
 
 
 def test_worker_reconciles_a_merge_completed_during_review(merge_case, monkeypatch):

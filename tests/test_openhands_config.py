@@ -455,23 +455,6 @@ def test_inbox_recovery_budget_is_explicit_and_configurable(tmp_path):
     assert configured.inbox_max_recovery_generations == 2
 
 
-def test_blocking_review_round_cap_is_explicit_and_configurable(tmp_path):
-    default = resolve_config(
-        parse_runner_args(["--max-turns", "1"]),
-        runtime_env(tmp_path),
-    )
-    env = runtime_env(tmp_path)
-    env["SENPAI_MAX_BLOCKING_REVIEW_ROUNDS"] = "3"
-
-    configured = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
-
-    assert default.max_blocking_review_rounds == 2
-    assert configured.max_blocking_review_rounds == 3
-    env["SENPAI_MAX_BLOCKING_REVIEW_ROUNDS"] = "0"
-    with pytest.raises(RuntimeError, match="at least 1"):
-        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
-
-
 def test_compaction_trigger_tokens_are_explicit_and_configurable(tmp_path):
     default = resolve_config(
         parse_runner_args(["--max-turns", "1"]),
