@@ -6,6 +6,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# A new push to a pull request supersedes its running checks. Pushes to
+# branches and manual runs each get their own group and never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
