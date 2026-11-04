@@ -5,42 +5,44 @@ from pathlib import Path
 ADVISOR = Path(__file__).resolve().parents[1] / "system_instructions" / "ADVISOR.md"
 
 
-def test_critique_briefs_must_not_anchor_the_critic():
+def section(text: str, heading: str) -> str:
+    return text.split(heading, 1)[1].split("\n## ", 1)[0]
+
+
+def test_critique_briefs_leave_the_conclusion_to_the_critic():
     """Both critiques behind a three-day idle decision were told the verdict."""
 
     text = ADVISOR.read_text(encoding="utf-8")
-    section = text.split("### Critique and ideation briefs", 1)[1].split("\n## ", 1)[0]
+    critique = section(text, "### Critique and ideation briefs")
 
-    assert "must not state your own verdict" in section
-    assert "must not hand the critic an exit" in section
-    assert "confirm the verdict" in section
-    assert "a confident NONE is a valid answer" in section
-    assert "not independent evidence" in section
+    assert "let it reach its own conclusion" in critique
+    assert "Keep your own verdict and any suggested answer out of the brief" in critique
+    assert "not independent evidence" in critique
 
 
-def test_sustained_no_keep_runs_two_differently_briefed_critics():
+def test_sustained_no_improvement_briefs_two_critics_differently():
     text = ADVISOR.read_text(encoding="utf-8")
-    section = text.split("### Critique and ideation briefs", 1)[1].split("\n## ", 1)[0]
+    critique = section(text, "### Critique and ideation briefs")
 
-    assert "no keep for a sustained period" in section
-    assert "ignoring your dead-ends table" in section
-    assert "best long-shot regardless of any bar" in section
-    assert "access to public code" in section
+    assert "brief two critics in different ways" in critique
+    assert "without your list of failed ideas" in critique
+    assert "most promising long shot" in critique
+    assert "access to public code" in critique
 
 
-def test_idle_policy_keeps_students_assigned_and_does_not_wait_for_the_operator():
-    """Four students idled about 230 GPU-hours after a verdict of "no lane"."""
+def test_students_always_have_an_experiment():
+    """Four students idled for days after a verdict that no candidate qualified."""
 
     text = ADVISOR.read_text(encoding="utf-8")
-    section = text.split("## Idle policy", 1)[1].split("\n## ", 1)[0]
+    policy = section(text, "## Always run experiments")
 
-    assert "never left without an assignment while GPUs are allocated" in section
-    assert "`create_human_issue`" in section
-    assert "widening the research focus" in section
-    assert "best public or library alternative" in section
-    assert "kill criterion" in section
-    assert "Do not wait for the answer" in section
-    assert "every idle student has an exploratory assignment" in section
+    assert "has an assignment at all times" in policy
+    assert "bounded exploratory experiments" in policy
+    assert "time box and a stopping rule" in policy
+    assert "best public or library alternative" in policy
+    assert "idle student costs as much as a busy one" in policy
+    for word in ("lane", "issue"):
+        assert word not in policy, word
 
 
 def test_advisor_instructions_stay_target_agnostic():
