@@ -63,4 +63,6 @@ GitHub transition in the root.
 
 ## Collect results
 
-`spawn_agents` returns task IDs immediately. Continue useful work, then use bounded `await_agents` calls with `all`, `first`, `quorum`, or `change` and a timeout of at most 300 seconds. Use `agent_status` for one non-blocking snapshot and `cancel_agents` when work is no longer useful; do not poll.
+`spawn_agents` returns task IDs immediately. Continue useful work, then use bounded `await_agents` calls with `all`, `first`, `quorum`, or `change` and a timeout of at most 300 seconds; a larger timeout is rejected, so wait again instead. Use `agent_status` for one non-blocking snapshot and `cancel_agents` when work is no longer useful; do not poll.
+
+A child's result is the text it wrote with its final `finish` call plus the finish message. A result above about 15,000 tokens is saved to a file under the role state's `delegation/results/` directory, and the result carries a summary and that path; read the file when the summary is not enough.
