@@ -87,6 +87,10 @@ jobs:
           # A pull request's image is never used, so it stays in the build cache.
           outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || '' }}
           pull: true
+          # The published image carries its layer cache, so a pull request that
+          # leaves the lock alone reuses the dependency and browser layers.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=inline' || '' }}
           build-args: |
             SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}
           tags: ${{ steps.meta.outputs.tags }}

@@ -47,9 +47,6 @@ ENV SENPAI_PYTHON=/opt/senpai-venv/bin/python \
 
 # The base image supplies the training stack, so Senpai prunes its own copy.
 COPY pyproject.toml uv.lock /tmp/senpai/
-COPY senpai_agent /tmp/senpai/senpai_agent
-COPY .agents/agents /opt/senpai-agent-definitions
-COPY plugins/senpai /opt/senpai-plugin
 # A standalone BuildKit daemon (docker buildx's docker-container driver) hands
 # every RUN step OTEL_EXPORTER_OTLP_TRACES_ENDPOINT, its trace socket, unless the
 # build sets the variable itself. openhands-sdk reads that as tracing being on
@@ -66,7 +63,7 @@ RUN cd /tmp/senpai && \
       --prune timm \
       --prune einops \
       > requirements.txt && \
-    uv pip install --python "$SENPAI_PYTHON" \
+    uv pip install --python "$SENPAI_PYTHON" --compile-bytecode \
       --only-binary cryptography \
       --only-binary jiter \
       --only-binary litellm \
@@ -74,14 +71,9 @@ RUN cd /tmp/senpai && \
       --only-binary pydantic-core \
       --only-binary rpds-py \
       -r requirements.txt && \
-    uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai "pip==25.3" && \
-    python -P -c 'import importlib.metadata, importlib.util, openhands.sdk, senpai_agent, sys; assert sys.version_info[:2] == (3, 14); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.58.2"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
-    python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
-    chown -R root:root \
-      /opt/senpai-venv /opt/senpai-python "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
-    chmod -R a-w \
-      /opt/senpai-venv /opt/senpai-python "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
-    rm -rf /root/.cache/uv /tmp/senpai
+    chown -R root:root /opt/senpai-venv /opt/senpai-python && \
+    chmod -R a-w /opt/senpai-venv /opt/senpai-python && \
+    rm -rf /root/.cache/uv
 
 COPY scripts/senpai-browser-smoke-test.py /usr/local/bin/senpai-browser-smoke-test
 
@@ -97,6 +89,22 @@ RUN uvx --from "playwright==${PLAYWRIGHT_VERSION}" \
     chown -R 10001:10001 \
       /home/senpai /workspace /workspaces /var/lib/senpai && \
     rm -rf /root/.cache/uv /root/.config/browseruse /var/lib/apt/lists/*
+
+# The runner and its assets change with every commit, so they come last and
+# only the files they add still need to be made read-only.
+COPY senpai_agent /tmp/senpai/senpai_agent
+COPY .agents/agents /opt/senpai-agent-definitions
+COPY plugins/senpai /opt/senpai-plugin
+RUN cd /tmp/senpai && \
+    uv pip install --python "$SENPAI_PYTHON" --no-deps /tmp/senpai "pip==25.3" && \
+    site_packages="$(python -P -c 'import sysconfig; print(sysconfig.get_path("purelib"))')" && \
+    python -P -m compileall -q "$site_packages/pip" "$site_packages/senpai_agent" && \
+    python -P -c 'import importlib.metadata, importlib.util, openhands.sdk, senpai_agent, sys; assert sys.version_info[:2] == (3, 14); assert importlib.util.find_spec("torch") is None; assert importlib.metadata.version("openhands-sdk") == "1.58.2"; assert importlib.metadata.version("weave-openhands") == "0.1.0"' && \
+    python -P -m senpai_agent.agent_markdown "$SENPAI_PLUGIN" && \
+    chown -R root:root "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+    chmod -R a-w "$SENPAI_AGENT_DIR" "$SENPAI_PLUGIN" && \
+    find /opt/senpai-venv -perm /0222 -exec chmod a-w {} + && \
+    rm -rf /root/.cache/uv /tmp/senpai
 
 ENV HOME=/home/senpai
 

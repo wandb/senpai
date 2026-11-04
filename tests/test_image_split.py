@@ -192,7 +192,10 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
         'uv pip install --python "$SENPAI_PYTHON" --no-deps --compile-bytecode /tmp/senpai'
         in root_setup
     )
-    assert '"pip==25.3"' in root_setup
+    # Dependencies are compiled when they are installed; the runner layer
+    # compiles only what it adds, so a code change does not recompile the venv.
+    assert "--compile-bytecode" in root_setup.split("-r requirements.txt", 1)[0]
+    assert 'compileall -q "$site_packages/pip" "$site_packages/senpai_agent"' in root_setup
     assert "SENPAI_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
     assert "UV_PYTHON=/opt/senpai-venv/bin/python" in dockerfile
     assert "UV_PROJECT_ENVIRONMENT" not in dockerfile
@@ -202,10 +205,18 @@ def test_images_install_the_runner_and_protect_runtime_assets(role: str):
     ):
         assert f"COPY {source} {destination}" in root_setup
     for command in ("chown -R root:root", "chmod -R a-w"):
-        protected = root_setup.split(command, 1)[1].split("&&", 1)[0]
+        protected = " ".join(
+            part.split("&&", 1)[0] for part in root_setup.split(command)[1:]
+        )
         assert "/opt/senpai-venv" in protected
         assert '"$SENPAI_AGENT_DIR"' in protected
         assert '"$SENPAI_PLUGIN"' in protected
+    # The venv is read-only before the runner is installed into it, so only the
+    # files the runner layer adds are left to protect.
+    assert root_setup.index("chmod -R a-w /opt/senpai-venv") < root_setup.index(
+        "COPY senpai_agent /tmp/senpai/senpai_agent"
+    )
+    assert "find /opt/senpai-venv -perm /0222 -exec chmod a-w {} +" in root_setup
     for user_ownership in root_setup.split("chown -R 10001:10001")[1:]:
         writable = user_ownership.split("&&", 1)[0]
         assert "/opt/senpai-venv" not in writable
