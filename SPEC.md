@@ -947,7 +947,7 @@ Students receive:
 
 ```text
 run_training(spec: TrainingSpec) -> TrainingResult
-get_training_status(training_id: str) -> TrainingResult
+get_training_status(training_id: str, wait_seconds: int = 0) -> TrainingResult
 cancel_training(training_id: str) -> TrainingResult
 monitor_training(
   training_id,

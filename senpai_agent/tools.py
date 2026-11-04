@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self
@@ -241,10 +242,31 @@ class RunTrainingAction(Action):
     )
 
 
+# How long one get_training_status call may wait for a running run. Foreground
+# terminal calls return within the same ten minutes.
+MAX_STATUS_WAIT_SECONDS = 600
+# A repeat status call on a run checked this recently waits out the remainder,
+# so a status loop cannot spin faster than once a minute.
+STATUS_REPEAT_SECONDS = 60
+_STATUS_POLL_SECONDS = 1.0
+
+
 class GetTrainingStatusAction(Action):
     training_id: str = Field(
         min_length=1,
         description="Training ID returned by run_training.",
+    )
+    wait_seconds: int = Field(
+        default=0,
+        ge=0,
+        le=MAX_STATUS_WAIT_SECONDS,
+        description=(
+            "Seconds to wait inside this call for the run to reach a terminal "
+            "state before returning its record; 0 returns the latest record at "
+            "once. Finishing the turn is the fast path: Senpai resumes this "
+            "conversation as soon as the run ends or, for a run in this pod, its "
+            "log stalls."
+        ),
     )
 
 
@@ -341,6 +363,8 @@ class TrainingResultObservation(Observation):
     kubernetes_pod_receipt: dict | None = None
     source_snapshot: str | None = None
     source_commit: str | None = None
+    # Set on a running record: how long the call waited and what to do next.
+    status_note: str = ""
 
     @classmethod
     def from_result(
@@ -380,6 +404,8 @@ class TrainingResultObservation(Observation):
             result["log_stalled_since"] = self.log_stalled_since
         if self.last_log_line:
             result["last_log_line"] = self.last_log_line
+        if self.status_note:
+            result["status_note"] = self.status_note
         if self.kubernetes_resource is not None:
             result["kubernetes_resource"] = self.kubernetes_resource.model_dump()
         if self.kubernetes_released is not None:
@@ -453,18 +479,116 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
 class _GetTrainingStatusExecutor(
     ToolExecutor[GetTrainingStatusAction, TrainingResultObservation]
 ):
-    def __init__(self, training: TrainingRuntime):
+    def __init__(
+        self,
+        training: TrainingRuntime,
+        monitor_store: MonitorStore | None = None,
+    ):
         self.training = training
+        self.monitor_store = monitor_store
+        self._changed = threading.Condition()
+        self._interrupt_generation = 0
+        # When each still-running run was last reported, for pacing repeats.
+        self._reported_running: dict[str, float] = {}
 
     def __call__(
         self,
         action: GetTrainingStatusAction,
         conversation: LocalConversation | None = None,
     ) -> TrainingResultObservation:
-        return TrainingResultObservation.from_result(
-            self.training.get_training_status(action.training_id),
-            conversation,
+        started = time.monotonic()
+        deadline = started + action.wait_seconds
+        with self._changed:
+            generation = self._interrupt_generation
+            reported = self._reported_running.get(action.training_id)
+        # A repeat check on a run reported running within the last minute waits
+        # out that minute whatever wait_seconds says, so a short wait in a loop
+        # cannot check faster than once a minute.
+        paced = reported is not None and reported + STATUS_REPEAT_SECONDS > deadline
+        if paced:
+            deadline = reported + STATUS_REPEAT_SECONDS
+        result = self.training.get_training_status(action.training_id)
+        stalled_at_start = result.log_stalled_since
+        interrupted = False
+        # The wait ends with the run, with a change in its log-stall state, at
+        # the deadline, or when the conversation is interrupted.
+        while (
+            result.state is TrainingState.RUNNING
+            and result.log_stalled_since == stalled_at_start
+            and (remaining := deadline - time.monotonic()) > 0
+        ):
+            with self._changed:
+                interrupted = self._changed.wait_for(
+                    lambda: self._interrupt_generation != generation,
+                    timeout=min(_STATUS_POLL_SECONDS, remaining),
+                )
+            if interrupted:
+                break
+            result = self.training.get_training_status(action.training_id)
+        running = result.state is TrainingState.RUNNING
+        with self._changed:
+            if running:
+                self._reported_running[action.training_id] = time.monotonic()
+            else:
+                self._reported_running.pop(action.training_id, None)
+            interrupted = interrupted or self._interrupt_generation != generation
+        if not running and not interrupted:
+            self._retire_monitor(action.training_id, conversation)
+        observation = TrainingResultObservation.from_result(result, conversation)
+        if running:
+            stalled = (
+                result.log_stalled_since is not None
+                and result.log_stalled_since != stalled_at_start
+            )
+            observation = observation.model_copy(
+                update={
+                    "status_note": _running_status_note(
+                        time.monotonic() - started, paced=paced, stalled=stalled
+                    )
+                }
+            )
+        return observation
+
+    def _retire_monitor(
+        self, training_id: str, conversation: LocalConversation | None
+    ) -> None:
+        """A terminal record delivered here needs no wake turn to deliver it again."""
+
+        if self.monitor_store is None or conversation is None:
+            return
+        for monitor in self.monitor_store.active():
+            if (
+                monitor.training_id == training_id
+                and monitor.conversation_id == conversation.id
+            ):
+                self.monitor_store.complete(training_id)
+
+    def interrupt(self) -> None:
+        with self._changed:
+            self._interrupt_generation += 1
+            self._changed.notify_all()
+
+
+def _running_status_note(waited: float, *, paced: bool, stalled: bool) -> str:
+    note = f"Still running after {waited:.0f} s." if waited >= 1 else "Still running."
+    if stalled:
+        note += (
+            " Its log stopped growing during the wait; see log_stalled_since "
+            "and last_log_line."
         )
+    note += (
+        " Senpai resumes this conversation as soon as the run ends or, for a run "
+        "in this pod, its log stalls, so finish the turn instead of calling again. "
+        "To wait inside this turn, call get_training_status with wait_seconds "
+        f"(up to {MAX_STATUS_WAIT_SECONDS})."
+    )
+    if paced:
+        note = (
+            "This repeat call waited because the same run was reported running "
+            f"less than {STATUS_REPEAT_SECONDS} s ago; it returns the latest "
+            "record. " + note
+        )
+    return note
 
 
 class _CancelTrainingExecutor(
@@ -511,7 +635,8 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
                     "automatically monitor its terminal state for this conversation. "
                     "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
-                    "policy; use get_training_status for a bounded immediate check."
+                    "policy; use get_training_status for a bounded check or, with "
+                    "wait_seconds, a bounded wait for the run to end."
                 ),
                 action_type=RunTrainingAction,
                 observation_type=TrainingResultObservation,
@@ -534,11 +659,18 @@ class GetTrainingStatusTool(
     def create(
         cls,
         training: TrainingRuntime,
+        monitor_store: MonitorStore | None = None,
     ) -> Sequence[Self]:
         return [
             cls(
                 description=(
-                    "Read the latest persisted result for one supervised training ID."
+                    "Read the latest persisted record of one supervised training run. "
+                    f"With wait_seconds (up to {MAX_STATUS_WAIT_SECONDS}), wait inside "
+                    "this call until the run reaches a terminal state or, for a run in "
+                    "this pod, its log stalls, then return the record. Finishing the "
+                    "turn is the fast path: Senpai resumes this conversation on the "
+                    "same events. A repeat call on a run reported running less than "
+                    f"{STATUS_REPEAT_SECONDS} s ago waits out the remainder."
                 ),
                 action_type=GetTrainingStatusAction,
                 observation_type=TrainingResultObservation,
@@ -549,7 +681,7 @@ class GetTrainingStatusTool(
                     idempotentHint=True,
                     openWorldHint=False,
                 ),
-                executor=_GetTrainingStatusExecutor(training),
+                executor=_GetTrainingStatusExecutor(training, monitor_store),
             )
         ]
 
@@ -679,7 +811,10 @@ class TrainingToolSet(ToolDefinition[RunTrainingAction, TrainingResultObservatio
                     os.environ.get("STUDENT_NAME", ""),
                 ),
             ),
-            *GetTrainingStatusTool.create(training=training),
+            *GetTrainingStatusTool.create(
+                training=training,
+                monitor_store=monitor_store,
+            ),
             *CancelTrainingTool.create(
                 training=training,
                 monitor_store=monitor_store,

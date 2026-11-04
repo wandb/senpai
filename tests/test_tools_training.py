@@ -1,6 +1,7 @@
 import json
 import subprocess
 import threading
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -60,6 +61,20 @@ class StubTraining:
 
     def close(self) -> None:
         self.closed = True
+
+
+class SequencedTraining(StubTraining):
+    """Return each queued record once, then the last one for every later check."""
+
+    def __init__(self, workspace: Path, results: list[TrainingResult]):
+        super().__init__(workspace, results[-1])
+        self.results = list(results)
+
+    def get_training_status(self, training_id: str) -> TrainingResult:
+        self.status_checks.append(training_id)
+        if len(self.results) > 1:
+            return self.results.pop(0)
+        return self.results[0]
 
 
 def init_workspace(tmp_path: Path) -> Path:
@@ -688,6 +703,185 @@ def test_get_training_status_delivers_complete_structured_pod_evidence(tmp_path,
     delivered = json.loads(observed.to_llm_content[0].text)
     assert delivered[field] == receipt
     assert training.status_checks == ['training-17']
+
+
+def running_result(tmp_path: Path) -> TrainingResult:
+    return finished_result(tmp_path).model_copy(
+        update={"state": TrainingState.RUNNING, "exit_code": None}
+    )
+
+
+def status_tool(training, monkeypatch: pytest.MonkeyPatch):
+    from senpai_agent.tools import GetTrainingStatusTool
+
+    monkeypatch.setattr(training_tools, "_STATUS_POLL_SECONDS", 0.02)
+    return GetTrainingStatusTool.create(training)[0]
+
+
+def test_get_training_status_waits_for_a_terminal_state(tmp_path: Path, monkeypatch):
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    running = running_result(tmp_path)
+    training = SequencedTraining(tmp_path, [running, running, finished_result(tmp_path)])
+    tool = status_tool(training, monkeypatch)
+
+    started = time.monotonic()
+    observed = tool.executor(
+        GetTrainingStatusAction(training_id="training-17", wait_seconds=30)
+    )
+
+    assert observed.state is TrainingState.FINISHED
+    assert observed.status_note == ""
+    assert training.status_checks == ["training-17"] * 3
+    assert time.monotonic() - started < 5
+
+
+def test_get_training_status_wait_is_bounded_and_says_to_finish_the_turn(
+    tmp_path: Path, monkeypatch
+):
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    training = StubTraining(tmp_path, running_result(tmp_path))
+    tool = status_tool(training, monkeypatch)
+
+    started = time.monotonic()
+    observed = tool.executor(
+        GetTrainingStatusAction(training_id="training-17", wait_seconds=1)
+    )
+    waited = time.monotonic() - started
+
+    assert observed.state is TrainingState.RUNNING
+    assert 1 <= waited < 5
+    delivered = json.loads(observed.to_llm_content[0].text)
+    assert delivered["status_note"].startswith("Still running after 1 s.")
+    assert "finish the turn" in delivered["status_note"]
+    assert "wait_seconds (up to 600)" in delivered["status_note"]
+    assert len(training.status_checks) > 10
+
+
+def test_repeated_status_checks_on_a_running_run_are_paced(tmp_path: Path, monkeypatch):
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    monkeypatch.setattr(training_tools, "STATUS_REPEAT_SECONDS", 1.5)
+    running = running_result(tmp_path)
+    training = SequencedTraining(
+        tmp_path, [running] * 400 + [finished_result(tmp_path)]
+    )
+    tool = status_tool(training, monkeypatch)
+    action = GetTrainingStatusAction(training_id="training-17")
+
+    started = time.monotonic()
+    first = tool.executor(action)
+    first_took = time.monotonic() - started
+    # A short wait on a repeat is paced too: the floor is the repeat interval.
+    second = tool.executor(GetTrainingStatusAction(training_id="training-17", wait_seconds=1))
+    second_took = time.monotonic() - started - first_took
+
+    assert first.state is TrainingState.RUNNING
+    assert first_took < 0.3
+    assert first.status_note.startswith("Still running. ")
+    assert "repeat call" not in first.status_note
+    assert second.state is TrainingState.RUNNING
+    assert 1.3 <= second_took < 4
+    assert second.status_note.startswith("This repeat call waited")
+    assert "returns the latest record" in second.status_note
+
+    training.results = [finished_result(tmp_path)]
+    started = time.monotonic()
+    third = tool.executor(action)
+    assert third.state is TrainingState.FINISHED
+    assert time.monotonic() - started < 0.3
+    # A run that ended is forgotten; a check of another run is never paced.
+    assert tool.executor(GetTrainingStatusAction(training_id="training-18")).state is (
+        TrainingState.FINISHED
+    )
+
+
+def test_a_log_stall_during_the_wait_ends_it(tmp_path: Path, monkeypatch):
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    running = running_result(tmp_path)
+    stalled = running.model_copy(update={"log_stalled_since": 1_700_000_000.0})
+    training = SequencedTraining(tmp_path, [running, running, stalled])
+    tool = status_tool(training, monkeypatch)
+
+    started = time.monotonic()
+    observed = tool.executor(
+        GetTrainingStatusAction(training_id="training-17", wait_seconds=30)
+    )
+
+    assert observed.state is TrainingState.RUNNING
+    assert time.monotonic() - started < 5
+    assert training.status_checks == ["training-17"] * 3
+    assert "Its log stopped growing during the wait" in observed.status_note
+
+
+def test_a_terminal_record_read_by_its_own_conversation_retires_the_monitor(
+    tmp_path: Path, monkeypatch
+):
+    from senpai_agent.monitor import TrainingMonitorSpec
+    from senpai_agent.tools import GetTrainingStatusAction, GetTrainingStatusTool
+
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    owner = uuid.uuid4()
+    monitors.register(TrainingMonitorSpec(training_id="training-17", conversation_id=owner))
+    training = SequencedTraining(
+        tmp_path, [running_result(tmp_path), finished_result(tmp_path)]
+    )
+    monkeypatch.setattr(training_tools, "_STATUS_POLL_SECONDS", 0.02)
+    status = GetTrainingStatusTool.create(training, monitor_store=monitors)[0].executor
+    action = GetTrainingStatusAction(training_id="training-17")
+
+    try:
+        assert status(action, SimpleNamespace(id=owner)).state is TrainingState.RUNNING
+        assert len(monitors.active()) == 1
+        # Another conversation reading the terminal record leaves the wake alone.
+        assert status(action, SimpleNamespace(id=uuid.uuid4())).state is TrainingState.FINISHED
+        assert len(monitors.active()) == 1
+
+        assert status(action, SimpleNamespace(id=owner)).state is TrainingState.FINISHED
+
+        assert monitors.active() == []
+    finally:
+        monitors.close()
+
+
+def test_interrupting_a_status_wait_returns_the_running_record(
+    tmp_path: Path, monkeypatch
+):
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    training = StubTraining(tmp_path, running_result(tmp_path))
+    tool = status_tool(training, monkeypatch)
+    observed: list[TrainingResultObservation] = []
+    thread = threading.Thread(
+        target=lambda: observed.append(
+            tool.executor(
+                GetTrainingStatusAction(training_id="training-17", wait_seconds=60)
+            )
+        )
+    )
+
+    started = time.monotonic()
+    thread.start()
+    time.sleep(0.2)
+    tool.executor.interrupt()
+    thread.join(5)
+
+    assert not thread.is_alive()
+    assert time.monotonic() - started < 3
+    assert observed[0].state is TrainingState.RUNNING
+
+
+def test_status_wait_is_bounded_by_the_schema():
+    from pydantic import ValidationError
+
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    assert GetTrainingStatusAction(training_id="t", wait_seconds=600).wait_seconds == 600
+    for value in (601, -1):
+        with pytest.raises(ValidationError):
+            GetTrainingStatusAction(training_id="t", wait_seconds=value)
 
 
 def test_log_stall_interval_defaults_to_half_an_hour():

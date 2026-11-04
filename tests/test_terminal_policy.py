@@ -153,6 +153,43 @@ def test_policy_denies_foreground_polling(command: str):
     assert is_allowed(command) is False
 
 
+@pytest.mark.parametrize("command", ["sleep 30", "watch -n 5 nvidia-smi"])
+def test_polling_denial_names_the_wait_tool_and_the_turn_boundary(command: str):
+    decision = terminal_policy(command, "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "get_training_status" in decision.reason
+    assert "wait_seconds" in decision.reason
+    assert "Finish the turn" in decision.reason
+
+
+def test_log_stream_denial_names_a_bounded_read_and_the_wait_tool():
+    decision = terminal_policy("tail -f training.log", "student", WORKSPACE)
+
+    assert decision.allowed is False
+    assert "tail -n 50" in decision.reason
+    assert "get_training_status(training_id, wait_seconds)" in decision.reason
+
+
+@pytest.mark.parametrize("role", ["advisor", ""])
+def test_agents_without_training_tools_are_told_to_finish_the_turn(role: str):
+    polling = terminal_policy("sleep 30", role, WORKSPACE)
+    streaming = terminal_policy("tail -f agent.log", role, WORKSPACE)
+
+    assert polling.allowed is False and streaming.allowed is False
+    assert "get_training_status" not in polling.reason + streaming.reason
+    assert "Finish the turn" in polling.reason
+    assert "await_agents" in polling.reason
+    assert "tail -n 50" in streaming.reason
+
+
+def test_tail_follow_with_retry_is_denied_like_follow():
+    for command in ("tail -F training.log", "tail -nF 50 training.log", "tail --follow=name x"):
+        assert terminal_policy(command, "student", WORKSPACE).allowed is False, command
+    for command in ("tail -n 50 training.log", "tail -n +1 x", "tail -c 100 x"):
+        assert terminal_policy(command, "student", WORKSPACE).allowed is True, command
+
+
 @pytest.mark.parametrize("destination", ["/tmp/notes.txt", "sh"])
 def test_quoted_file_heredoc_treats_restricted_words_as_literal_data(destination: str):
     command = f"""cat > {destination} <<'EOF'
