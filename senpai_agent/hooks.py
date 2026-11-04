@@ -142,14 +142,24 @@ _GIT_FETCH_REASON = (
 )
 _POLLING_REASON = (
     "Do not sleep or poll in the terminal. Finish the turn: Senpai resumes this "
-    "conversation as soon as a supervised run ends or its log stalls. To wait "
-    "inside this turn, call get_training_status with the run's training_id and "
-    "wait_seconds (up to 600)."
+    "conversation as soon as a supervised run ends or, for a run in this pod, its "
+    "log stalls. To wait inside this turn, call get_training_status with the "
+    "run's training_id and wait_seconds (up to 600)."
 )
 _LOG_STREAM_REASON = (
     "Do not stream logs. Read a bounded slice with `tail -n 50 <log_path>`, and "
     "wait for the run with get_training_status(training_id, wait_seconds) or by "
     "finishing the turn; Senpai resumes this conversation when the run ends."
+)
+# Only students hold the training tools; every other agent waits on agents.
+_POLLING_REASON_WITHOUT_TRAINING = (
+    "Do not sleep or poll in the terminal. Finish the turn: Senpai resumes this "
+    "conversation when the event you are waiting for arrives. To wait for child "
+    "agents inside this turn, call await_agents."
+)
+_LOG_STREAM_REASON_WITHOUT_TRAINING = (
+    "Do not stream logs. Read a bounded slice with `tail -n 50 <log_path>` and "
+    "finish the turn; Senpai resumes this conversation when there is news."
 )
 # `uv run` options that take a separate value before the program.
 _UV_RUN_VALUE_OPTIONS = {
@@ -1174,7 +1184,7 @@ def _runner_policy(
 
     command = _shell_command(arguments)
     if command is not None:
-        decision = terminal_policy(command, "", workspace)
+        decision = _terminal_decision(command, workspace)
         if not decision.allowed:
             return decision
     for position, argument in enumerate(arguments):
@@ -1312,7 +1322,7 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
             )
         command = _shell_command(arguments)
         if command is not None:
-            return terminal_policy(command, "", workspace)
+            return _terminal_decision(command, workspace)
     if program == "time":
         command = _time_command(arguments)
         if command is None:
@@ -1407,7 +1417,10 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
     if program in {"sleep", "watch"}:
         return PolicyDecision(False, _POLLING_REASON)
     if program == "tail" and any(
-        argument == "--follow" or argument.startswith("-") and "f" in argument[1:]
+        argument.startswith("--follow")
+        or argument.startswith("-")
+        and not argument.startswith("--")
+        and set("fF") & set(argument[1:])
         for argument in tokens[index + 1 :]
     ):
         return PolicyDecision(False, _LOG_STREAM_REASON)
@@ -1419,7 +1432,17 @@ def terminal_policy(
     role: str,
     workspace: Path,
 ) -> PolicyDecision:
-    del role
+    decision = _terminal_decision(command, workspace)
+    if decision.allowed or role == "student":
+        return decision
+    if decision.reason == _POLLING_REASON:
+        return PolicyDecision(False, _POLLING_REASON_WITHOUT_TRAINING)
+    if decision.reason == _LOG_STREAM_REASON:
+        return PolicyDecision(False, _LOG_STREAM_REASON_WITHOUT_TRAINING)
+    return decision
+
+
+def _terminal_decision(command: str, workspace: Path) -> PolicyDecision:
     nested_commands = _bash_commands(command, workspace)
     if nested_commands is None:
         return PolicyDecision(

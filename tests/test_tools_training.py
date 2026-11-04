@@ -762,10 +762,10 @@ def test_get_training_status_wait_is_bounded_and_says_to_finish_the_turn(
 def test_repeated_status_checks_on_a_running_run_are_paced(tmp_path: Path, monkeypatch):
     from senpai_agent.tools import GetTrainingStatusAction
 
-    monkeypatch.setattr(training_tools, "STATUS_REPEAT_SECONDS", 0.5)
+    monkeypatch.setattr(training_tools, "STATUS_REPEAT_SECONDS", 1.5)
     running = running_result(tmp_path)
     training = SequencedTraining(
-        tmp_path, [running] * 200 + [finished_result(tmp_path)]
+        tmp_path, [running] * 400 + [finished_result(tmp_path)]
     )
     tool = status_tool(training, monkeypatch)
     action = GetTrainingStatusAction(training_id="training-17")
@@ -773,15 +773,18 @@ def test_repeated_status_checks_on_a_running_run_are_paced(tmp_path: Path, monke
     started = time.monotonic()
     first = tool.executor(action)
     first_took = time.monotonic() - started
-    second = tool.executor(action)
+    # A short wait on a repeat is paced too: the floor is the repeat interval.
+    second = tool.executor(GetTrainingStatusAction(training_id="training-17", wait_seconds=1))
     second_took = time.monotonic() - started - first_took
 
     assert first.state is TrainingState.RUNNING
     assert first_took < 0.3
+    assert first.status_note.startswith("Still running. ")
     assert "repeat call" not in first.status_note
     assert second.state is TrainingState.RUNNING
-    assert 0.4 <= second_took < 3
+    assert 1.3 <= second_took < 4
     assert second.status_note.startswith("This repeat call waited")
+    assert "returns the latest record" in second.status_note
 
     training.results = [finished_result(tmp_path)]
     started = time.monotonic()
@@ -792,6 +795,55 @@ def test_repeated_status_checks_on_a_running_run_are_paced(tmp_path: Path, monke
     assert tool.executor(GetTrainingStatusAction(training_id="training-18")).state is (
         TrainingState.FINISHED
     )
+
+
+def test_a_log_stall_during_the_wait_ends_it(tmp_path: Path, monkeypatch):
+    from senpai_agent.tools import GetTrainingStatusAction
+
+    running = running_result(tmp_path)
+    stalled = running.model_copy(update={"log_stalled_since": 1_700_000_000.0})
+    training = SequencedTraining(tmp_path, [running, running, stalled])
+    tool = status_tool(training, monkeypatch)
+
+    started = time.monotonic()
+    observed = tool.executor(
+        GetTrainingStatusAction(training_id="training-17", wait_seconds=30)
+    )
+
+    assert observed.state is TrainingState.RUNNING
+    assert time.monotonic() - started < 5
+    assert training.status_checks == ["training-17"] * 3
+    assert "Its log stopped growing during the wait" in observed.status_note
+
+
+def test_a_terminal_record_read_by_its_own_conversation_retires_the_monitor(
+    tmp_path: Path, monkeypatch
+):
+    from senpai_agent.monitor import TrainingMonitorSpec
+    from senpai_agent.tools import GetTrainingStatusAction, GetTrainingStatusTool
+
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    owner = uuid.uuid4()
+    monitors.register(TrainingMonitorSpec(training_id="training-17", conversation_id=owner))
+    training = SequencedTraining(
+        tmp_path, [running_result(tmp_path), finished_result(tmp_path)]
+    )
+    monkeypatch.setattr(training_tools, "_STATUS_POLL_SECONDS", 0.02)
+    status = GetTrainingStatusTool.create(training, monitor_store=monitors)[0].executor
+    action = GetTrainingStatusAction(training_id="training-17")
+
+    try:
+        assert status(action, SimpleNamespace(id=owner)).state is TrainingState.RUNNING
+        assert len(monitors.active()) == 1
+        # Another conversation reading the terminal record leaves the wake alone.
+        assert status(action, SimpleNamespace(id=uuid.uuid4())).state is TrainingState.FINISHED
+        assert len(monitors.active()) == 1
+
+        assert status(action, SimpleNamespace(id=owner)).state is TrainingState.FINISHED
+
+        assert monitors.active() == []
+    finally:
+        monitors.close()
 
 
 def test_interrupting_a_status_wait_returns_the_running_record(
