@@ -27,6 +27,7 @@ SNAPSHOT_ENV = "SENPAI_CAPACITY_SNAPSHOT"
 MAX_SNAPSHOT_BYTES = 64 * 1024
 MAX_AGE_SECONDS = 120
 COLLECTION_SECONDS = 25
+PUBLICATION_SECONDS = 15
 MAX_ITEMS = 20_000
 MAX_PAGES = 100
 LIMITATIONS = (
@@ -494,7 +495,7 @@ def publish_capacity(
     client: KubernetesApiClient, config: CapacityConfig, namespace: str, configmap: str
 ) -> None:
     """Replace one precreated snapshot; failures never refresh old successful data."""
-    with _deadline(COLLECTION_SECONDS + 15):
+    with _deadline(COLLECTION_SECONDS + PUBLICATION_SECONDS):
         _publish_capacity(client, config, namespace, configmap)
 
 

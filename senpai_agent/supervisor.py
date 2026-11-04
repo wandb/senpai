@@ -59,6 +59,7 @@ from senpai_agent.system_instructions import (
 LEASE_ENV = "SENPAI_CONTROLLER_LEASE_PATH"
 HEALTH_PORT_ENV = "SENPAI_HEALTH_PORT"
 DEFAULT_HEALTH_PORT = 8080
+HEALTH_IDLE_SECONDS = 5
 
 
 @dataclass(frozen=True, slots=True)
@@ -488,7 +489,7 @@ def serve_lease_health(
     """Serve the worker lease without spawning credential-bearing probes."""
 
     class LeaseHealthHandler(BaseHTTPRequestHandler):
-        timeout = 5
+        timeout = HEALTH_IDLE_SECONDS
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path != "/healthz":
