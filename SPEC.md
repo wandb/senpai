@@ -585,7 +585,7 @@ on GitHub, so the tool can reject a change made after the student read the PR:
 | `publish_advisor_branch` | advisor | `remote_branch_sha_before_push`, `local_commit_sha` |
 | `repair_assignment_routing` | advisor | `working_state` (`wip` or `review`) and a `blockers` list containing only `blocked`, `hold`, or `needs-rebase` |
 | `send_assignment_feedback` | advisor | `feedback_id`, `comment` |
-| `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes |
+| `push_experiment_commit` | student | `local_commit_sha`, which must identify the current local commit (HEAD), with no uncommitted changes to tracked files |
 | `post_assignment_comment` | student | `comment_id`, `comment` |
 | `fetch_branch` | student, advisor | `branch`; fetches that branch of the target repository into `refs/remotes/origin/<branch>` of the checkout, read-only, and returns its head SHA |
 | `post_peer_comment` | student | `target_pr_number`, `comment_id`, `comment`; `assignment` identifies the sender's own current PR |
@@ -685,8 +685,8 @@ research-base SHA rather than leaving that base implicit.
 Student submission verifies the assignment branch and exact local result commit,
 publishes that commit with a remote-head lease, upserts the typed result, marks
 the PR ready, reconciles `status:review`, and verifies all postconditions.
-Uncommitted worktree changes are not published. Training separately requires a
-clean worktree. The label itself is the cross-node notification. A schema-valid result is immutable for its assignment
+Uncommitted worktree changes are not published. Training separately requires
+every tracked file to be committed. The label itself is the cross-node notification. A schema-valid result is immutable for its assignment
 revision and head: canonical-identical duplicates are one idempotent result,
 while different evidence must use a new commit or revision. Result records are
 append-only across revision/head identities, and gates select only the record
@@ -1014,8 +1014,14 @@ training. Explicit cancellation and
 timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
 
-The student commits the exact implementation and cleans the worktree before an
-expensive launch. Before reserving resources or starting a process, `run_training`
+The student commits the exact implementation before an expensive launch;
+`run_training` refuses a modified tracked file by name, and records untracked,
+not ignored files in a snapshot commit beside `HEAD`
+(`refs/senpai/snapshots/<sha>`, up to 1 MiB per file, 2,000 files and 64 MiB
+per snapshot, the rest named only) and in the run record (the first twenty
+paths and the count), so lane output does not block a launch. The refs
+accumulate for the life of the checkout. A remote worker runs from `HEAD`
+without those files, and a remote launch whose `argv` names one is refused. Before reserving resources or starting a process, `run_training`
 reads the current open WIP assignment from GitHub and checks that its revision
 maps to this conversation in `student-conversations.json`. Missing, ambiguous,
 unreadable, or superseded assignments prevent a new launch. This admission check
@@ -1066,8 +1072,9 @@ child result for one assignment cannot consume or permanently block a training
 event for another.
 
 The Stop hook always verifies the automatic monitor marker and normally
-requires a clean worktree. While queued PR feedback waits for a safe boundary,
-a role-local marker waives only the clean-worktree check; the pump clears it
+requires every tracked file to be committed, naming the ones that are not;
+untracked files may stay. While queued PR feedback waits for a safe boundary,
+a role-local marker waives only that check; the pump clears it
 before delivery and on entry and exit.
 The advisor and advisor children never receive training tools.
 

@@ -19,6 +19,7 @@ from typing import BinaryIO, Literal
 import psutil
 from pydantic import BaseModel, ConfigDict, Field
 
+from senpai_agent.worktree_snapshot import NAMED_PATHS, WorktreeSnapshot
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
 # W&B prints a run's page as <host>/<entity>/<project>/runs/<id>, on wandb.ai
@@ -227,6 +228,14 @@ class TrainingResult(BaseModel):
     kubernetes_pod_receipt: dict | None = None
     source_snapshot: str | None = None
     source_commit: str | None = None
+    # Commit of HEAD plus the untracked files present at launch, kept under
+    # refs/senpai/snapshots/<sha> in the assignment worktree; None when the
+    # worktree held no untracked files.
+    worktree_snapshot: str | None = None
+    # The first NAMED_PATHS untracked paths and how many there were; the
+    # snapshot commit's message holds them all.
+    untracked_paths: tuple[str, ...] = ()
+    untracked_count: int = 0
 
 
 def training_result_paths(state_dir: Path) -> Iterator[Path]:
@@ -249,11 +258,25 @@ class _ActiveTraining:
     started: float
     timeout_seconds: int
     log_path: Path
+    worktree: dict[str, object]
     cancelled: bool = False
     thread: threading.Thread | None = None
     output_thread: threading.Thread | None = None
     output_stop: threading.Event = field(default_factory=threading.Event)
     output_error: str | None = None
+
+
+def worktree_record_fields(worktree: WorktreeSnapshot | None) -> dict[str, object]:
+    """Return the result fields that name what the worktree held at launch."""
+
+    if worktree is None:
+        return {}
+    return {
+        "source_commit": worktree.head_sha,
+        "worktree_snapshot": worktree.snapshot_sha,
+        "untracked_paths": worktree.untracked_paths[:NAMED_PATHS],
+        "untracked_count": len(worktree.untracked_paths),
+    }
 
 
 class TrainingSupervisor:
@@ -319,7 +342,12 @@ class TrainingSupervisor:
                 )
             )
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def run_training(
+        self,
+        spec: TrainingSpec,
+        *,
+        worktree: WorktreeSnapshot | None = None,
+    ) -> TrainingResult:
         if isinstance(spec.argv, str) or not spec.argv:
             raise ValueError("argv must be a non-empty sequence, not a shell string")
         cwd = Path(spec.cwd).resolve()
@@ -327,6 +355,7 @@ class TrainingSupervisor:
             raise ValueError("training cwd must be inside the assignment workspace")
 
         training_id = str(uuid.uuid4())
+        worktree_fields = worktree_record_fields(worktree)
         log_path = self.state_dir / f"{training_id}.log"
         started = time.monotonic()
         log_path.touch()
@@ -355,6 +384,7 @@ class TrainingSupervisor:
             exit_code=None,
             elapsed_seconds=0,
             log_path=str(log_path),
+            **worktree_fields,
         )
         self._write_result(result)
         active = _ActiveTraining(
@@ -364,6 +394,7 @@ class TrainingSupervisor:
             started=started,
             timeout_seconds=spec.timeout_seconds,
             log_path=log_path,
+            worktree=worktree_fields,
         )
         thread = threading.Thread(
             target=self._monitor,
@@ -504,6 +535,7 @@ class TrainingSupervisor:
                             wandb_run_ids=discovered_run_ids,
                             log_stalled_since=stalled_since,
                             last_log_line=_last_log_line(error_tail),
+                            **active.worktree,
                         )
                     )
                     if stalled_since is not None and stalled_since != published_stalled_since:
@@ -589,6 +621,7 @@ class TrainingSupervisor:
                 else ""
             ),
             last_log_line=_last_log_line(error_tail),
+            **active.worktree,
         )
         self._write_result(result)
         with self._lock:

@@ -1607,3 +1607,23 @@ def test_blocked_live_pod_capture_does_not_delay_cancellation(tmp_path, monkeypa
         if cancellation.ident is not None:
             cancellation.join(5)
         runtime.close()
+
+
+def test_a_remote_launch_whose_argv_names_an_untracked_file_is_refused(tmp_path, monkeypatch):
+    from senpai_agent.worktree_snapshot import WorktreeSnapshot
+
+    runtime, workspace, _snapshot_root = supervisor(tmp_path, monkeypatch)
+    worktree = WorktreeSnapshot("a" * 40, ("configs/sweep.yaml", "notes.md"), "b" * 40)
+
+    try:
+        for argv in (
+            ("python", "train.py", "--config", "configs/sweep.yaml"),
+            ("python", "train.py", "--config=configs/sweep.yaml"),
+        ):
+            with pytest.raises(ValueError, match="configs/sweep.yaml.*runs from HEAD"):
+                runtime.run_training(
+                    TrainingSpec(argv=argv, cwd=workspace, timeout_seconds=5),
+                    worktree=worktree,
+                )
+    finally:
+        runtime.close()

@@ -104,6 +104,8 @@ def test_push_experiment_commit_without_submitting_or_releasing_hold(publication
     before = deepcopy(case.fake.pr)
     tool = publication_tool(case)
     action = publication_action(tool, case)
+    # Untracked lane output beside the code does not block a push.
+    (case.workspace / "results.json").write_text("{}\n")
 
     first = tool(action)
     replay = tool(action)
@@ -125,7 +127,7 @@ def test_push_experiment_commit_without_submitting_or_releasing_hold(publication
         ("revision", "stale turn"),
         ("closed", "open and unmerged"),
         ("review", "status:wip"),
-        ("dirty", "worktree must be clean"),
+        ("dirty", "uncommitted changes to tracked files: model.py"),
         ("base", "does not contain assigned research base"),
         ("head", "pull request head SHA"),
         ("foreign-branch", "branch must belong to student"),
@@ -151,7 +153,8 @@ def test_push_experiment_commit_rejects_invalid_current_source_before_push(
     elif guard == "review":
         case.fake.pr["labels"] = {"student:student-one", "status:review"}
     elif guard == "dirty":
-        (case.workspace / "uncommitted.py").write_text("not published\n")
+        (case.workspace / "model.py").write_text("baseline = 3\n")
+        (case.workspace / "results.json").write_text("{}\n")
     elif guard == "base":
         unrelated = git(case.workspace, "commit-tree", "HEAD^{tree}", "-m", "unrelated")
         case.fake.pr["body"] = render_assignment_marker(

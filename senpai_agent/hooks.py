@@ -10,9 +10,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from senpai_agent.git_transport import run_git
+from senpai_agent.git_transport import GitWorkflowPreconditionError
 from senpai_agent.secrets import SHELL_STARTUP_ENV_NAMES
 from senpai_agent.training import training_result_paths
+from senpai_agent.worktree_snapshot import require_tracked_changes_committed
 
 
 QUEUED_FEEDBACK_MARKER = "queued-feedback-pending"
@@ -125,13 +126,13 @@ _GH_READ_ONLY = {
 _TRAIN_LAUNCHERS = {"accelerate", "deepspeed", "torchrun"}
 _TRAIN_SCRIPT = re.compile(r"^train[^/]*[.]py$")
 # Programs whose detached launch hides GPU work from run_training's supervision:
-# no timeout, no log or W&B record, no clean-worktree check, no wake on exit.
+# no timeout, no log or W&B record, no worktree check, no wake on exit.
 _GPU_PROGRAMS = {"compute-sanitizer", "kernel-bench", "ncu", "nsys", "nvcc"} | _TRAIN_LAUNCHERS
 _DETACHED_LAUNCHERS = {"nohup", "setsid"}
 _DETACHED_GPU_REASON = (
     "Do not launch GPU jobs detached from the terminal (nohup, setsid, or a "
     "trailing &); use run_training. It supervises the process, records its log "
-    "and W&B run ids, keeps the clean-worktree check, and resumes this "
+    "and W&B run ids, keeps the worktree check, and resumes this "
     "conversation as soon as the run ends or its log stalls, so there is "
     "nothing to poll for."
 )
@@ -1493,12 +1494,12 @@ def _stop_policy(
                 f"{', '.join(sorted(unmonitored))}",
             )
     if require_clean_workspace:
-        if run_git(working_dir, "status", "--porcelain", "--untracked-files=all"):
-            return PolicyDecision(
-                False,
-                "Commit the exact implementation before training or discard "
-                "incidental assignment changes before finishing.",
-            )
+        # The same rule as run_training and push_experiment_commit: untracked
+        # files may stay, a modified tracked file may not.
+        try:
+            require_tracked_changes_committed(working_dir)
+        except GitWorkflowPreconditionError as error:
+            return PolicyDecision(False, f"{error} Commit before finishing.")
     return PolicyDecision(True)
 
 

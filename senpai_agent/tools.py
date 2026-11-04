@@ -42,7 +42,11 @@ from senpai_agent.delegation import (
 )
 from senpai_agent.capacity_tool import ClusterCapacityTool
 from senpai_agent.exa_tool import ExaSearchTool
-from senpai_agent.git_workflow import require_clean_training_worktree
+from senpai_agent.worktree_snapshot import (
+    WorktreeSnapshot,
+    require_tracked_changes_committed,
+    snapshot_training_worktree,
+)
 from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
@@ -70,7 +74,9 @@ class TrainingRuntime(Protocol):
     # Set when a run needs the student's attention; the controller waits on it.
     wake: threading.Event
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult: ...
+    def run_training(
+        self, spec: TrainingSpec, *, worktree: WorktreeSnapshot | None = None
+    ) -> TrainingResult: ...
 
     def get_training_status(self, training_id: str) -> TrainingResult: ...
 
@@ -365,6 +371,9 @@ class TrainingResultObservation(Observation):
     source_commit: str | None = None
     # Set on a running record: how long the call waited and what to do next.
     status_note: str = ""
+    worktree_snapshot: str | None = None
+    untracked_paths: tuple[str, ...] = ()
+    untracked_count: int = 0
 
     @classmethod
     def from_result(
@@ -406,6 +415,26 @@ class TrainingResultObservation(Observation):
             result["last_log_line"] = self.last_log_line
         if self.status_note:
             result["status_note"] = self.status_note
+        if self.source_commit is not None:
+            result["source_commit"] = self.source_commit
+        if self.untracked_paths:
+            result["untracked_paths"] = self.untracked_paths
+            result["untracked_count"] = self.untracked_count
+            result["worktree_snapshot"] = self.worktree_snapshot
+            if self.kubernetes_spec is not None:
+                ran = (
+                    "The worker ran from source_commit without them; if the run "
+                    "depended on one, commit it and launch again."
+                )
+            else:
+                ran = (
+                    "They are not in source_commit; commit any file the result "
+                    "depends on before submitting."
+                )
+            result["worktree_note"] = (
+                f"Untracked files were present at launch. {ran} Inspect what the "
+                f"worktree held with `git show --stat {self.worktree_snapshot}`."
+            )
         if self.kubernetes_resource is not None:
             result["kubernetes_resource"] = self.kubernetes_resource.model_dump()
         if self.kubernetes_released is not None:
@@ -443,11 +472,15 @@ class _RunTrainingExecutor(ToolExecutor[RunTrainingAction, TrainingResultObserva
     ) -> TrainingResultObservation:
         if conversation is None:
             raise ValueError("run_training requires its student conversation")
-        require_clean_training_worktree(self.training.workspace)
+        # Modified tracked files refuse the launch before anything else is
+        # checked; untracked lane output is named in the record and stored in a
+        # snapshot commit beside HEAD once the conversation may launch.
+        require_tracked_changes_committed(self.training.workspace)
+        self.assignment_guard.require_current(conversation.id)
+        worktree = snapshot_training_worktree(self.training.workspace)
         with self._lock:
             interrupt_generation = self._interrupt_generation
-        self.assignment_guard.require_current(conversation.id)
-        result = self.training.run_training(action.spec)
+        result = self.training.run_training(action.spec, worktree=worktree)
         with self._lock:
             self._in_flight.add(result.training_id)
             interrupted = interrupt_generation != self._interrupt_generation
@@ -633,6 +666,10 @@ class RunTrainingTool(ToolDefinition[RunTrainingAction, TrainingResultObservatio
                 description=(
                     "Start one supervised training process without blocking and "
                     "automatically monitor its terminal state for this conversation. "
+                    "Tracked files must be committed; untracked files such as results "
+                    "or scratch scripts (ignored paths excepted) are allowed, named in "
+                    "the result and stored in a worktree snapshot commit beside HEAD. "
+                    "A remote worker runs from HEAD without them. "
                     "Only the current assignment revision conversation may launch. "
                     "Use monitor_training only to add metric gates or staleness "
                     "policy; use get_training_status for a bounded check or, with "

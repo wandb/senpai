@@ -43,12 +43,14 @@ class StubTraining:
         self.workspace = workspace
         self.result = result
         self.launched: list[TrainingSpec] = []
+        self.worktrees: list[object] = []
         self.status_checks: list[str] = []
         self.cancelled: list[str] = []
         self.closed = False
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def run_training(self, spec: TrainingSpec, *, worktree=None) -> TrainingResult:
         self.launched.append(spec)
+        self.worktrees.append(worktree)
         return self.result
 
     def get_training_status(self, training_id: str) -> TrainingResult:
@@ -81,6 +83,13 @@ def init_workspace(tmp_path: Path) -> Path:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     subprocess.run(["git", "init", "--quiet"], cwd=workspace, check=True)
+    subprocess.run(["git", "config", "user.name", "Student"], cwd=workspace, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "student@example.com"], cwd=workspace, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-q", "--allow-empty", "-m", "baseline"], cwd=workspace, check=True
+    )
     return workspace
 
 
@@ -328,17 +337,26 @@ def test_training_error_tail_requires_the_conversation_secret_registry(
         TrainingResultObservation.from_result(result, conversation)
 
 
-def test_run_training_requires_a_clean_worktree_before_starting(
+def committed_workspace(tmp_path: Path) -> Path:
+    workspace = init_workspace(tmp_path)
+    (workspace / "candidate.py").write_text("print('committed')\n")
+    subprocess.run(["git", "add", "candidate.py"], cwd=workspace, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "candidate"], cwd=workspace, check=True)
+    return workspace
+
+
+def test_run_training_refuses_a_modified_tracked_file_and_names_it(
     tmp_path: Path, assignment_runtime
 ):
-    workspace = init_workspace(tmp_path)
+    workspace = committed_workspace(tmp_path)
     (workspace / "candidate.py").write_text("print('uncommitted')\n")
+    (workspace / "results.json").write_text("{}\n")
     training = StubTraining(workspace, finished_result(tmp_path))
     monitors = MonitorStore(tmp_path / "monitors.sqlite3")
     tool = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0]
 
     try:
-        with pytest.raises(RuntimeError, match="clean before training"):
+        with pytest.raises(RuntimeError) as error:
             tool.executor(
                 RunTrainingAction(
                     spec=TrainingSpec(
@@ -350,10 +368,107 @@ def test_run_training_requires_a_clean_worktree_before_starting(
                 SimpleNamespace(id=uuid.uuid4()),
             )
 
+        assert "uncommitted changes to tracked files: candidate.py" in str(error.value)
+        assert "results.json" not in str(error.value)
         assert training.launched == []
         assert monitors.active() == []
     finally:
         monitors.close()
+
+
+def test_run_training_starts_with_untracked_lane_output_and_records_it(
+    tmp_path: Path, assignment_runtime
+):
+    workspace = committed_workspace(tmp_path)
+    (workspace / "lane").mkdir()
+    (workspace / "lane" / "results.json").write_text("{}\n")
+    (workspace / "lane" / "scratch.py").write_text("pass\n")
+    head = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=workspace, text=True
+    ).strip()
+    training = StubTraining(workspace, finished_result(tmp_path))
+    monitors = MonitorStore(tmp_path / "monitors.sqlite3")
+    tool = RunTrainingTool.create(training, monitors, assignment_runtime.guard)[0]
+
+    try:
+        tool.executor(
+            RunTrainingAction(
+                spec=TrainingSpec(
+                    argv=("python", "candidate.py"),
+                    cwd=workspace,
+                    timeout_seconds=20,
+                )
+            ),
+            SimpleNamespace(id=assignment_runtime.conversation_id),
+        )
+    finally:
+        monitors.close()
+
+    assert len(training.launched) == 1
+    [worktree] = training.worktrees
+    assert worktree.head_sha == head
+    assert worktree.untracked_paths == ("lane/results.json", "lane/scratch.py")
+    assert worktree.snapshot_sha is not None
+    stored = subprocess.check_output(
+        ["git", "ls-tree", "-r", "--name-only", worktree.snapshot_sha],
+        cwd=workspace,
+        text=True,
+    ).split()
+    assert stored == ["candidate.py", "lane/results.json", "lane/scratch.py"]
+
+
+def test_training_observation_names_untracked_files_and_the_snapshot(tmp_path: Path):
+    from senpai_agent.training import worktree_record_fields
+    from senpai_agent.worktree_snapshot import WorktreeSnapshot
+
+    paths = tuple(f"lane/out-{index:02d}.json" for index in range(25))
+    fields = worktree_record_fields(WorktreeSnapshot("a" * 40, paths, "b" * 40))
+    result = finished_result(tmp_path).model_copy(update=fields)
+
+    delivered = json.loads(
+        TrainingResultObservation.from_result(result, None).to_llm_content[0].text
+    )
+
+    assert delivered["source_commit"] == "a" * 40
+    assert delivered["worktree_snapshot"] == "b" * 40
+    # The record keeps the first twenty paths and the count; the snapshot
+    # commit message names them all.
+    assert result.untracked_paths == paths[:20]
+    assert delivered["untracked_paths"] == list(paths[:20])
+    assert delivered["untracked_count"] == 25
+    assert "git show --stat " + "b" * 40 in delivered["worktree_note"]
+    assert "commit any file the result depends on before submitting" in delivered["worktree_note"]
+
+    clean = json.loads(
+        TrainingResultObservation.from_result(
+            finished_result(tmp_path), None
+        ).to_llm_content[0].text
+    )
+    assert "untracked_paths" not in clean
+    assert "worktree_note" not in clean
+
+
+def test_a_remote_runs_note_says_the_worker_ran_without_the_untracked_files(tmp_path: Path):
+    from senpai_agent.training import KubernetesTrainingSpec
+
+    result = finished_result(tmp_path).model_copy(
+        update={
+            "source_commit": "a" * 40,
+            "worktree_snapshot": "b" * 40,
+            "untracked_paths": ("configs/sweep.yaml",),
+            "untracked_count": 1,
+            "kubernetes_spec": KubernetesTrainingSpec(
+                kind="Job", name="senpai-fred-fern-1", namespace="research", wandb_run_id="r1"
+            ),
+        }
+    )
+
+    delivered = json.loads(
+        TrainingResultObservation.from_result(result, None).to_llm_content[0].text
+    )
+
+    assert "The worker ran from source_commit without them" in delivered["worktree_note"]
+    assert "commit it and launch again" in delivered["worktree_note"]
 
 
 def test_run_training_requires_a_conversation_before_starting(

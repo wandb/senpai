@@ -24,6 +24,7 @@ from typing import Protocol, TypedDict
 import psutil
 
 from senpai_agent.processes import terminate_process_group
+from senpai_agent.worktree_snapshot import NAMED_PATHS, WorktreeSnapshot, name_paths
 from senpai_agent.training import (
     KubernetesResourceRef,
     KubernetesTrainingSpec,
@@ -790,7 +791,12 @@ class KubernetesTrainingSupervisor:
         self.state_dir.mkdir(parents=True, exist_ok=True)
         self._recover()
 
-    def run_training(self, spec: TrainingSpec) -> TrainingResult:
+    def run_training(
+        self,
+        spec: TrainingSpec,
+        *,
+        worktree: WorktreeSnapshot | None = None,
+    ) -> TrainingResult:
         if (
             self.max_timeout_seconds is not None
             and spec.timeout_seconds > self.max_timeout_seconds
@@ -802,6 +808,18 @@ class KubernetesTrainingSupervisor:
         cwd = spec.cwd.resolve()
         if cwd != self.workspace and not cwd.is_relative_to(self.workspace):
             raise ValueError("training cwd must be inside the assignment workspace")
+        if worktree is not None:
+            # The bundle ships HEAD only, so a worker never has these files.
+            named = [
+                path
+                for path in worktree.untracked_paths
+                if any(path in {argument, argument.rpartition("=")[2]} for argument in spec.argv)
+            ]
+            if named:
+                raise ValueError(
+                    "argv names untracked files the worker will not have: "
+                    f"{name_paths(named)}. The worker runs from HEAD; commit them first"
+                )
         with self._lock:
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")
@@ -873,6 +891,10 @@ class KubernetesTrainingSupervisor:
                 kubernetes_released=False,
                 source_snapshot=str(source_snapshot),
                 source_commit=source_commit,
+                # The bundle carries HEAD only; a worker never sees these files.
+                worktree_snapshot=worktree.snapshot_sha if worktree else None,
+                untracked_paths=worktree.untracked_paths[:NAMED_PATHS] if worktree else (),
+                untracked_count=len(worktree.untracked_paths) if worktree else 0,
             )
             active = _ActiveRemoteTraining(
                 spec=kubernetes_spec,

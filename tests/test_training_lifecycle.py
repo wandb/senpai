@@ -1,8 +1,11 @@
+import sys
+import time
 from pathlib import Path
 
 import pytest
 
-from senpai_agent.training import TrainingState, TrainingSupervisor
+from senpai_agent.worktree_snapshot import WorktreeSnapshot
+from senpai_agent.training import TrainingSpec, TrainingState, TrainingSupervisor
 from training_test_support import (
     assert_process_stopped,
     make_supervisor,
@@ -33,6 +36,36 @@ def test_finished_training_persists_its_result_and_log(tmp_path: Path):
     assert terminal.wandb_run_ids == ("run-123",)
     assert Path(terminal.log_path).read_text().strip().endswith("/runs/run-123")
     assert reopened == terminal
+
+
+def test_worktree_facts_survive_every_record_rewrite(tmp_path: Path):
+    workspace, supervisor = make_supervisor(tmp_path)
+    worktree = WorktreeSnapshot(
+        head_sha="a" * 40,
+        untracked_paths=("lane/results.json",),
+        snapshot_sha="b" * 40,
+    )
+
+    running = supervisor.run_training(
+        TrainingSpec(
+            argv=(sys.executable, "-c", "import time; print('x', flush=True); time.sleep(0.3)"),
+            cwd=workspace,
+            timeout_seconds=20,
+        ),
+        worktree=worktree,
+    )
+    time.sleep(0.1)
+    mid_run = supervisor.get_training_status(running.training_id)
+    terminal = wait_for_terminal(supervisor, running.training_id)
+
+    for record in (running, mid_run, terminal):
+        assert record.source_commit == "a" * 40
+        assert record.worktree_snapshot == "b" * 40
+        assert record.untracked_paths == ("lane/results.json",)
+    assert terminal.state is TrainingState.FINISHED
+
+    plain = run_python(supervisor, workspace, "print('no worktree')")
+    assert wait_for_terminal(supervisor, plain.training_id).source_commit is None
 
 
 def test_recovery_ignores_non_training_json_sidecars(tmp_path: Path):
