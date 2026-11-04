@@ -14,6 +14,7 @@ from pydantic import SecretStr
 from launch_test_support import launch, launch_args, render_role
 from openhands_support import launch_env
 from senpai_agent.custom_openai import CustomOpenAIEndpoint
+from senpai_agent.PROMPTS import COMPACTION_SUMMARY_PROMPT
 from senpai_agent.openhands_runner import (
     local_condenser,
     model_runtime_configuration,
@@ -84,9 +85,9 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
         trigger = call_kwargs["context_management"]["edits"][0]["trigger"][
             "value"
         ]
-        assert "instructions" not in call_kwargs["context_management"][
-            "edits"
-        ][0]
+        assert call_kwargs["context_management"]["edits"][0]["instructions"] == (
+            COMPACTION_SUMMARY_PROMPT
+        )
 
     assert config.compaction_trigger_tokens == 200_000
     assert trigger == 200_000

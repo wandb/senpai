@@ -45,6 +45,7 @@ from senpai_agent.github.tools import GitHubWorkflowToolSet
 from senpai_agent.kubernetes_training import KubernetesTrainingSupervisor
 from senpai_agent.monitor import MetricGate, MonitorStore, TrainingMonitorSpec
 from senpai_agent.PROMPTS import MONITOR_TRAINING_STARTED_PROMPT, render_prompt
+from senpai_agent.research_state import UpdateResearchStateTool
 from senpai_agent.training_assignment import TrainingAssignmentGuard
 from senpai_agent.training import (
     KubernetesResourceRef,
@@ -870,6 +871,7 @@ def register_senpai_tools() -> None:
         return
     register_tool("senpai_training", TrainingToolSet)
     register_tool("get_cluster_capacity", ClusterCapacityTool)
+    register_tool("update_research_state", UpdateResearchStateTool)
     register_tool("senpai_github", GitHubWorkflowToolSet)
     register_tool("spawn_agents", SpawnAgentsTool)
     register_tool("await_agents", AwaitAgentsTool)

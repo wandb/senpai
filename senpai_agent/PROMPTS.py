@@ -179,6 +179,19 @@ EVENT_PROMPT = """## {{KIND}}
 
 {{PAYLOAD}}"""
 
+COMPACTION_SUMMARY_PROMPT = """Summarize for the agent that continues this work. Keep every exact identifier: pull request numbers, commit SHAs, branch names, run and job ids, task ids and file paths. Keep every decision with its reason, every numeric result and bar, the open questions, the pending work and the standing operator instructions. Drop procedural reminders about how to use tools or when to check the clock; the harness states the current time in each delivery and re-sends the saved research state after each compaction. Do not call tools while writing this summary; return text only."""
+
+CONTEXT_COMPACTED_PROMPT = """## Context compacted
+
+Your conversation context was compacted at {{COMPACTED_AT}} ({{TRIGGER}}). The research state below is the copy you saved with `update_research_state` at {{UPDATED_AT}}. It is authoritative over the compaction summary for identifiers, lanes, bars, budget and operator rules. Update it after every decision.
+
+```json
+{{STATE}}
+```"""
+
+CONTEXT_COMPACTED_WITHOUT_STATE_PROMPT = """## Context compacted
+
+Your conversation context was compacted at {{COMPACTED_AT}} ({{TRIGGER}}). No research state has been saved yet, so only the compaction summary carries what you knew. Save one now with `update_research_state`: current best with identifiers, lanes in flight, bars, budget, operator rules, open questions and recent decisions. The harness re-sends it verbatim after every compaction."""
 DELIVERY_TIME_PROMPT = """Delivered at (UTC): {{CURRENT_TIME}}"""
 
 STUDENT_AVAILABLE_FOR_ASSIGNMENT_PROMPT = """## Student available for assignment: `{{STUDENT}}`
@@ -234,6 +247,21 @@ def render_event_prompt(kind: str, payload: Mapping[str, object]) -> str:
         return render_prompt(
             STUDENT_AVAILABLE_FOR_ASSIGNMENT_PROMPT,
             STUDENT=str(payload["student"]),
+        )
+    if kind == "context_compacted":
+        state = payload["research_state"]
+        if state is None:
+            return render_prompt(
+                CONTEXT_COMPACTED_WITHOUT_STATE_PROMPT,
+                COMPACTED_AT=str(payload["compacted_at"]),
+                TRIGGER=str(payload["trigger"]),
+            )
+        return render_prompt(
+            CONTEXT_COMPACTED_PROMPT,
+            COMPACTED_AT=str(payload["compacted_at"]),
+            TRIGGER=str(payload["trigger"]),
+            UPDATED_AT=str(state["updated_at"]),
+            STATE=json.dumps(state, indent=2, sort_keys=True, ensure_ascii=False),
         )
     return render_prompt(
         EVENT_PROMPT,
