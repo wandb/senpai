@@ -157,13 +157,17 @@ def test_main_agent_context_appends_program_after_harness_and_role():
 
 def test_student_charter_requires_pasted_identifiers_and_labelled_derived_numbers():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
+    assert "## Report and submit" in instructions and "## Writing style" in instructions
     report = instructions.split("## Report and submit", 1)[1].split("## Writing style", 1)[0]
 
-    assert "Paste every identifier and digest exactly as a tool printed it." in report
-    assert "never from memory" in report
-    assert "run the command that prints it before you cite it" in report
+    # One copy rule, stated once, covering every identifier class.
+    assert report.count("never from memory") == 1
+    assert "Copy every W&B run id, commit SHA, digest, training id, job id and run state" in report
+    assert "A prefix of a printed value is fine; a retyped one is not." in report
+    assert "A condensation summary is not tool output" in report
+    assert "run the command or tool that prints it, or cite it by URL" in report
     assert "Label any number you computed yourself as derived and show the arithmetic" in report
-    assert "derived: +0.66% = (118.20 − 117.42) / 118.20" in report
+    assert "`derived:" in report and "baseline" in report and "candidate" in report
     assert "precision the tool printed and no more" in report
 
 
