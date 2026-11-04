@@ -204,12 +204,15 @@ def test_cutoff_has_a_minimal_commit_built_image():
     assert "python --version" in dockerfile
     assert "openhands" not in dockerfile.lower()
     assert "torch" not in dockerfile.lower()
-    assert set(workflow["jobs"]["build"]["strategy"]["matrix"]["role"]) == {
-        "advisor",
-        "student",
-        "executor",
-        "cutoff",
-    }
+    # The plan job chooses between image lists; every one of them builds cutoff.
+    plan = workflow["jobs"]["plan"]["steps"][0]["run"]
+    role_lists = [
+        json.loads(line.split("=", 1)[1].strip("'"))
+        for line in plan.splitlines()
+        if line.strip().startswith("roles=")
+    ]
+    assert len(role_lists) == 2
+    assert all("cutoff" in roles for roles in role_lists)
 
 
 def test_cutoff_dry_run_keeps_readiness_and_delete_without_archive_rbac(tmp_path):
