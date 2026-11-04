@@ -48,7 +48,8 @@ from senpai_agent.PROMPTS import CODE_QUALITY_REVIEW_PROMPT
 APPROVED = code_review.CodeQualityVerdict(
     approved=True, review_summary="Focused change.", findings=[], notes=[],
 )
-FINDING = "model.py:1: Remove the unused fallback; callers already require a value."
+FINDING_TEXT = "Line 1: remove the unused fallback; callers already require a value."
+FINDING = code_review.ReviewFinding(path="model.py", finding=FINDING_TEXT)
 REJECTED = code_review.CodeQualityVerdict(
     approved=False, review_summary="Unnecessary complexity.", findings=[FINDING],
     notes=[],
@@ -397,6 +398,32 @@ def test_non_blocking_notes_merge_and_are_published_with_the_approval(
         )
 
 
+def test_review_must_be_complete_and_findings_name_their_file(merge_case, monkeypatch):
+    """In one campaign the reviewer found one class of problem per round, so a
+    PR went through twelve rejections with its deliverable unchanged."""
+
+    prompts = []
+
+    def review(prompt, _config, *, response_schema, on_structured_result):
+        prompts.append(prompt)
+        on_structured_result(REJECTED)
+        return 0
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+
+    result = execute(merge_case)
+
+    assert result["state"] == "merge_blocked"
+    assert merge_case.fake.pr["merged"] is False
+    posted = merge_case.fake.comments[-1]["body"]
+    assert "**Verdict: Rejected**" in posted
+    assert f"- model.py: {FINDING_TEXT}" in posted
+    assert "This review must be complete." in prompts[0]
+    assert "each with the repository path it concerns" in prompts[0]
+    assert "confirm that each earlier finding is resolved" in prompts[0]
+    assert "Deliverable" not in prompts[0]
+
+
 def test_worker_reconciles_a_merge_completed_during_review(merge_case, monkeypatch):
     def review(_prompt, _config, *, response_schema, on_structured_result):
         merge_case.fake.pr.update(merged=True, state="closed", merge_commit_sha="merge-sha")
@@ -416,7 +443,7 @@ def test_worker_reconciles_a_merge_completed_during_review(merge_case, monkeypat
 @pytest.mark.parametrize(
     ("verdict", "status", "remaining", "reason"),
     [
-        (REJECTED, 0, 600, FINDING),
+        (REJECTED, 0, 600, FINDING_TEXT),
         (None, 1, 600, "did not complete"),
         (RuntimeError("provider unavailable"), None, 600, "provider unavailable"),
         (None, None, -1, "insufficient time remains"),
@@ -512,7 +539,7 @@ def test_failed_feedback_preserves_review_reason_and_does_not_comment_on_new_hea
 
     assert result["state"] in {"merge_blocked", "merge_failed"}
     if verdict is REJECTED:
-        assert FINDING in result["reason"]
+        assert FINDING_TEXT in result["reason"]
         assert "feedback_error" in result
     assert len(merge_case.fake.comments) == 1
     assert merge_case.fake.pr["merged"] is False
@@ -628,7 +655,7 @@ def test_worker_requires_native_structured_review_in_one_private_conversation(
                 if response_kind == "malformed-finish":
                     arguments["approved"] = "true"
                 elif response_kind == "inconsistent-finish":
-                    arguments["findings"] = [FINDING]
+                    arguments["findings"] = [FINDING.model_dump()]
                 action = self.finish.action_from_arguments(arguments)
                 tool_call = MessageToolCall(
                     id="review-finish", name=self.finish.name,

@@ -131,6 +131,8 @@ Block only problems that would leave the research branch wrong, unsafe, or mater
 - generated artifacts or files unrelated to the task, such as logs, checkpoints, or scratch outputs;
 - dead code paths or configs left by unsuccessful experiments, or substantial unnecessary complexity in the code this change adds.
 
+This review must be complete. Report every blocking finding in the whole diff now, each with the repository path it concerns, so that one revision resolves them all. If the discussion shows earlier merge reviews of this PR, confirm that each earlier finding is resolved and report anything the fixes introduced.
+
 Report everything else as non-blocking notes and approve: documentation length or wording, naming, CLI flag names or small unused options, formatting, and minor simplifications. The advisor can tidy these later. Allow additions justified by the task or target program.
 
 ## Research context

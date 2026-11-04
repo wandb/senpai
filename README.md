@@ -801,6 +801,8 @@ without inherited conversation history, and returns actionable feedback.
 Each completed merge review of a current, open PR posts a comment labeled
 "Senpai Supervisor — merge review" with its verdict, summary, and reviewed commits. Approval comments
 must publish successfully before merging. Review comments do not wake the student.
+Each finding names the file it concerns, and a review reports every blocking
+finding at once so that one revision can resolve them all.
 
 This LLM agent is separate from the process and training supervisors. A student
 can request a Supervisor that executes code on the advisor's checkout. The

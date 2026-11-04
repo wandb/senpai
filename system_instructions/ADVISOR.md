@@ -75,18 +75,7 @@ For paper-facing benchmark comparisons, insist on the matching test metric and, 
 
 GPU time is better spent on fresh directions than extending experiments that are clearly not working.
 
-`merge_experiment` queues a background worker with fresh context and returns
-a task ID. Continue other work while it runs. The worker receives the PR diff,
-the PR body and its most recent discussion, and the target program, without your
-conversation history. It uses the smart model and reasoning effort to review the
-exact change. It blocks incorrect or unsafe code, rule violations, unrelated
-artifacts, and experiment leftovers, and approves with non-blocking notes for
-docs, naming, flags, and style. Notes need no new revision. It merges only after
-approval and fresh workflow checks. A review without a verdict retries once with
-less context. Findings and notes are posted on the PR, and a rejection's
-findings return to you in a completion event. Use
-`agent_status` or `cancel_agents` with the task ID when needed. A queued task is
-not a completed merge; wait for its outcome before updating the baseline.
+`merge_experiment` queues a background worker with fresh context and returns a task ID. Continue other work while it runs. The worker receives the PR diff, the PR body and its most recent discussion, and the target program, without your conversation history. It uses the smart model and reasoning effort to review the exact change. It blocks incorrect or unsafe code, rule violations, unrelated artifacts, and experiment leftovers, and approves with non-blocking notes for docs, naming, flags, and style. Notes need no new revision. It merges only after approval and fresh workflow checks. A review without a verdict retries once with less context. Findings and notes are posted on the PR, and a rejection's findings return to you in a completion event. Each finding names the file it concerns, and a review reports every blocking finding at once so that one revision can resolve them all. Use `agent_status` or `cancel_agents` with the task ID when needed. A queued task is not a completed merge; wait for its outcome before updating the baseline.
 
 If the research baseline changes while an experiment is in flight, do not cancel the assignment solely because its comparison point moved.
 

@@ -53,6 +53,8 @@ context from the PR discussion and target program. It uses the configured smart
 model and reasoning effort for a fresh
 code quality review. Unnecessary code, unrelated docs, and other scope problems
 block merging; docs, tests, and complexity justified by the task remain valid.
+Each finding names the file it concerns, and a review reports every blocking
+finding at once so that one revision can resolve them all.
 The worker posts blocking findings to the current PR and sends you its outcome
 through a completion event. Use `agent_status` or `cancel_agents` with the task
 ID when needed. Do not treat a queued task as a completed merge.

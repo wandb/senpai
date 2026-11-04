@@ -54,6 +54,22 @@ class CodeReviewRejected(WorkflowPreconditionError):
     """A completed, valid review found actionable code-quality problems."""
 
 
+class ReviewFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    path: str | None = Field(
+        description=(
+            "Repository path of the file the finding is about, or null when it "
+            "concerns the change as a whole."
+        ),
+    )
+    finding: ReviewText = Field(
+        description="The problem and its actionable fix, with line references where useful.",
+    )
+    def render(self) -> str:
+        return f"{self.path}: {self.finding}" if self.path else self.finding
+
+
 class CodeQualityVerdict(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
@@ -69,11 +85,11 @@ class CodeQualityVerdict(BaseModel):
             "If blocked, explain what must change and why."
         ),
     )
-    findings: list[ReviewText] = Field(
+    findings: list[ReviewFinding] = Field(
         description=(
-            "Blocking issues only, each with an actionable fix and file or line "
-            "references where useful. Include any reason the review is incomplete. "
-            "Empty on approval."
+            "Every blocking issue in the change, each with its file or line "
+            "reference and an actionable fix, so that one revision resolves them "
+            "all. Include any reason the review is incomplete. Empty on approval."
         ),
     )
     notes: list[ReviewText] = Field(
@@ -94,7 +110,7 @@ class CodeQualityVerdict(BaseModel):
     def report(self) -> str:
         sections = [self.review_summary]
         for title, items in (
-            ("Blocking findings", self.findings),
+            ("Blocking findings", [finding.render() for finding in self.findings]),
             ("Non-blocking notes", self.notes),
         ):
             if items:
