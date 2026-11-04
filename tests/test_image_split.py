@@ -230,12 +230,12 @@ def test_build_workflow_builds_all_images_from_the_exact_checked_out_commit():
     workflow = yaml.safe_load(source)
     events = yaml.load(source, Loader=yaml.BaseLoader)["on"]
     build = workflow["jobs"]["build"]
+    roles = build["strategy"]["matrix"]["role"]
     steps = {step["name"]: step for step in build["steps"]}
 
-    assert build["needs"] == "plan"
-    assert build["strategy"]["matrix"]["role"] == (
-        "${{ fromJSON(needs.plan.outputs.roles) }}"
-    )
+    assert set(roles) == {"advisor", "student", "executor", "cutoff"}
+    for name in ("Checkout", "Extract metadata", "Build and push"):
+        assert steps[name]["if"] == "steps.image.outputs.build == 'true'"
     assert events["pull_request"] == {}
     assert workflow["env"]["SOURCE_REVISION"] == (
         "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -257,39 +257,35 @@ def test_build_workflow_builds_all_images_from_the_exact_checked_out_commit():
     )
 
 
-ALL_IMAGES = ["advisor", "student", "executor", "cutoff"]
+CODE_CHANGES = ["senpai_agent/controller.py", "plugins/senpai/SKILL.md", "Dockerfile.advisor"]
 
 
 @pytest.mark.parametrize(
-    ("event", "changed", "expected"),
+    ("event", "role", "changed", "expected"),
     [
-        ("push", [], ALL_IMAGES),
-        ("workflow_dispatch", [], ALL_IMAGES),
-        (
-            "pull_request",
-            ["senpai_agent/controller.py", "plugins/senpai/SKILL.md", "Dockerfile.advisor"],
-            ["advisor", "executor", "cutoff"],
-        ),
-        ("pull_request", ["Dockerfile.student"], ALL_IMAGES),
-        ("pull_request", ["uv.lock"], ALL_IMAGES),
-        ("pull_request", ["pyproject.toml"], ALL_IMAGES),
-        ("pull_request", ["scripts/senpai-gpu-smoke-test.py"], ALL_IMAGES),
-        ("pull_request", [".github/workflows/build.yaml"], ALL_IMAGES),
+        ("push", "student", [], True),
+        ("workflow_dispatch", "student", [], True),
+        ("pull_request", "advisor", CODE_CHANGES, True),
+        ("pull_request", "student", CODE_CHANGES, False),
+        ("pull_request", "student", ["Dockerfile.student"], True),
+        ("pull_request", "student", ["uv.lock"], True),
+        ("pull_request", "student", ["pyproject.toml"], True),
+        ("pull_request", "student", ["scripts/senpai-gpu-smoke-test.py"], True),
+        ("pull_request", "student", [".github/workflows/build.yaml"], True),
     ],
 )
-def test_pull_requests_skip_the_student_image_unless_its_inputs_change(
+def test_a_pull_request_builds_the_student_image_only_when_its_inputs_change(
     tmp_path: Path,
     event: str,
+    role: str,
     changed: list[str],
-    expected: list[str],
+    expected: bool,
 ):
     workflow = yaml.safe_load(
         (ROOT / ".github" / "workflows" / "build.yaml").read_text(encoding="utf-8")
     )
-    step = workflow["jobs"]["plan"]["steps"][0]
-    assert workflow["jobs"]["plan"]["outputs"]["roles"] == (
-        f"${{{{ steps.{step['id']}.outputs.roles }}}}"
-    )
+    step = workflow["jobs"]["build"]["steps"][0]
+    assert step["id"] == "image"
 
     # Stand in for the GitHub API listing of the pull request's files.
     bin_dir = tmp_path / "bin"
@@ -307,6 +303,7 @@ def test_pull_requests_skip_the_student_image_unless_its_inputs_change(
         **os.environ,
         "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
         "STUDENT_INPUTS": step["env"]["STUDENT_INPUTS"],
+        "ROLE": role,
         "EVENT_NAME": event,
         "PULL_REQUEST_FILES": "repos/wandb/senpai/pulls/7/files",
         "GITHUB_OUTPUT": str(output),
@@ -314,8 +311,8 @@ def test_pull_requests_skip_the_student_image_unless_its_inputs_change(
 
     subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env=env)
 
-    roles = dict(line.split("=", 1) for line in output.read_text().splitlines())
-    assert json.loads(roles["roles"]) == expected
+    outputs = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert outputs["build"] == str(expected).lower()
 
 
 def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():

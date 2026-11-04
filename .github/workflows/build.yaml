@@ -17,18 +17,25 @@ env:
   SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
-  plan:
+  build:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        role: [advisor, student, executor, cutoff]
+    env:
+      IMAGE_NAME: ${{ github.repository }}-${{ matrix.role }}
     permissions:
       contents: read
+      packages: write
       pull-requests: read
-    outputs:
-      roles: ${{ steps.roles.outputs.roles }}
+
     steps:
-      - name: Choose the images to build
-        id: roles
+      - name: Decide whether this run needs the image
+        id: image
         env:
           GH_TOKEN: ${{ github.token }}
+          ROLE: ${{ matrix.role }}
           EVENT_NAME: ${{ github.event_name }}
           PULL_REQUEST_FILES: repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files
           STUDENT_INPUTS: '^(Dockerfile\.student$|pyproject\.toml$|uv\.lock$|scripts/|\.github/workflows/build\.yaml$)'
@@ -37,31 +44,15 @@ jobs:
           # training stack, and pulling that base takes longer than every other
           # check. A pull request that leaves the student's own inputs alone is
           # validated by the advisor build and skips the student build.
-          roles='["advisor", "student", "executor", "cutoff"]'
-          if [ "$EVENT_NAME" = pull_request ]; then
+          build=true
+          if [ "$EVENT_NAME" = pull_request ] && [ "$ROLE" = student ]; then
             changed=$(gh api --paginate "$PULL_REQUEST_FILES" --jq '.[].filename')
-            if ! grep -qE "$STUDENT_INPUTS" <<< "$changed"; then
-              roles='["advisor", "executor", "cutoff"]'
-            fi
+            grep -qE "$STUDENT_INPUTS" <<< "$changed" || build=false
           fi
-          echo "Building $roles"
-          echo "roles=$roles" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
-  build:
-    needs: plan
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        role: ${{ fromJSON(needs.plan.outputs.roles) }}
-    env:
-      IMAGE_NAME: ${{ github.repository }}-${{ matrix.role }}
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
       - name: Checkout
+        if: steps.image.outputs.build == 'true'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.SOURCE_REVISION }}
@@ -75,6 +66,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.image.outputs.build == 'true'
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
@@ -86,11 +78,14 @@ jobs:
             org.opencontainers.image.revision=${{ env.SOURCE_REVISION }}
 
       - name: Build and push
+        if: steps.image.outputs.build == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile.${{ matrix.role }}
           push: ${{ github.event_name != 'pull_request' }}
+          # A pull request's image is never used, so it stays in the build cache.
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || '' }}
           pull: true
           build-args: |
             SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}
@@ -120,6 +115,7 @@ jobs:
           context: .
           file: Dockerfile.student-on-base
           push: false
+          outputs: type=cacheonly
           pull: true
           build-args: |
             BASE_IMAGE=${{ env.CHECK_BASE_IMAGE }}
