@@ -1,6 +1,8 @@
 """Student GitHub tools refuse identifiers that no runtime record accounts for."""
 
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from git_workflow_support import repository
@@ -143,3 +145,34 @@ def test_submit_result_resolves_short_shas_and_refuses_unknown_runs(
             )
         )
     assert workflow.events == []
+
+
+def test_post_assignment_comment_checks_digests_against_the_conversations_tool_output(tmp_path):
+    workspace, _remote, _head = repository(tmp_path)
+    workflow = CommentWorkflow()
+    tool = PostAssignmentCommentTool.create(student_runtime(workflow, workspace, FakeLookup()))[0]
+    digest = "391730cf" + "0a1b2c3d" * 7
+    conversation = SimpleNamespace(
+        id=uuid.uuid4(),
+        state=SimpleNamespace(
+            events=[
+                SimpleNamespace(
+                    id="o1",
+                    action_id="a1",
+                    tool_name="terminal",
+                    observation=SimpleNamespace(
+                        model_dump=lambda: {"content": f"{digest}  submission.py"}
+                    ),
+                )
+            ]
+        ),
+    )
+
+    with pytest.raises(ProvenanceError, match="^digest '.*not printed by any tool"):
+        tool.executor(comment_action(f"SHA-256 {digest[:-1]}e of submission.py"), conversation)
+    assert workflow.events == []
+
+    posted = tool.executor(comment_action(f"SHA-256 {digest} of submission.py"), conversation)
+
+    assert posted.state == "assignment_comment_posted"
+    assert [event[0] for event in workflow.events] == ["comment"]

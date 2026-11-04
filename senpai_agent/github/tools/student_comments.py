@@ -34,7 +34,11 @@ class PostAssignmentCommentExecutor(
     ) -> GitHubMutationObservation:
         version = action.assignment
         if self.runtime.provenance is not None:
-            self.runtime.provenance.check_text(action.comment, source="comment")
+            self.runtime.provenance.check_text(
+                action.comment,
+                source="comment",
+                observed=self.runtime.provenance.observed(conversation),
+            )
         try:
             result = self.runtime.workflow.post_assignment_comment(
                 version.pr_number,

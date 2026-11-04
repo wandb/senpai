@@ -820,6 +820,13 @@ class KubernetesTrainingSupervisor:
                     "argv names untracked files the worker will not have: "
                     f"{name_paths(named)}. The worker runs from HEAD; commit them first"
                 )
+        if spec.expected_exit_codes != (0,):
+            raise ValueError(
+                "expected_exit_codes applies to runs supervised in this pod; a "
+                "remote workload's success is decided by its Kubernetes condition. "
+                "Wrap the command so its designed code exits 0, for example "
+                "sh -c 'cmd; rc=$?; [ \"$rc\" -eq 3 ] && exit 0; exit $rc'"
+            )
         with self._lock:
             if self._shutdown.is_set():
                 raise RuntimeError("Kubernetes training supervisor is closed")

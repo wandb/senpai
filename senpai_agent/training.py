@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from senpai_agent.worktree_snapshot import NAMED_PATHS, WorktreeSnapshot
 from senpai_agent.processes import signal_process_group, terminate_process_group
@@ -199,6 +199,23 @@ class TrainingSpec(BaseModel):
     argv: tuple[str, ...] = Field(min_length=1)
     cwd: Path
     timeout_seconds: int = Field(gt=0)
+    expected_exit_codes: tuple[int, ...] = Field(
+        default=(0,),
+        min_length=1,
+        description=(
+            "Exit codes that mean the process completed as designed, for example "
+            "[0, 3] for a gate that exits 3 when its check fails. Any other code "
+            "records the run as failed. Applies to runs supervised in this pod."
+        ),
+    )
+
+    @field_validator("expected_exit_codes")
+    @classmethod
+    def _designed_exit_codes(cls, codes: tuple[int, ...]) -> tuple[int, ...]:
+        # A clean exit is always a completed run, and a signal never is.
+        if 0 not in codes or any(not 0 <= code <= 255 for code in codes):
+            raise ValueError("expected_exit_codes must include 0 and lie within 0..255")
+        return codes
 
 
 class TrainingResult(BaseModel):
@@ -210,6 +227,8 @@ class TrainingResult(BaseModel):
     process_group_id: int | None = Field(default=None, gt=0)
     process_start_time: float | None = Field(default=None, gt=0)
     exit_code: int | None
+    # Exit codes the launch declared as completing the run as designed.
+    expected_exit_codes: tuple[int, ...] = (0,)
     elapsed_seconds: float
     log_path: str
     wandb_run_ids: tuple[str, ...] = ()
@@ -259,6 +278,7 @@ class _ActiveTraining:
     timeout_seconds: int
     log_path: Path
     worktree: dict[str, object]
+    expected_exit_codes: tuple[int, ...] = (0,)
     cancelled: bool = False
     thread: threading.Thread | None = None
     output_thread: threading.Thread | None = None
@@ -382,6 +402,7 @@ class TrainingSupervisor:
             process_group_id=process_group_id,
             process_start_time=process_start_time,
             exit_code=None,
+            expected_exit_codes=spec.expected_exit_codes,
             elapsed_seconds=0,
             log_path=str(log_path),
             **worktree_fields,
@@ -395,6 +416,7 @@ class TrainingSupervisor:
             timeout_seconds=spec.timeout_seconds,
             log_path=log_path,
             worktree=worktree_fields,
+            expected_exit_codes=spec.expected_exit_codes,
         )
         thread = threading.Thread(
             target=self._monitor,
@@ -530,6 +552,7 @@ class TrainingSupervisor:
                             process_group_id=active.process_group_id,
                             process_start_time=active.process_start_time,
                             exit_code=None,
+                            expected_exit_codes=active.expected_exit_codes,
                             elapsed_seconds=now - active.started,
                             log_path=str(active.log_path),
                             wandb_run_ids=discovered_run_ids,
@@ -563,7 +586,7 @@ class TrainingSupervisor:
                         if active.cancelled
                         else (
                             TrainingState.FINISHED
-                            if exit_code == 0
+                            if exit_code in active.expected_exit_codes
                             else TrainingState.FAILED
                         )
                     )
@@ -612,12 +635,15 @@ class TrainingSupervisor:
             process_group_id=active.process_group_id,
             process_start_time=active.process_start_time,
             exit_code=exit_code,
+            expected_exit_codes=active.expected_exit_codes,
             elapsed_seconds=time.monotonic() - active.started,
             log_path=str(active.log_path),
             wandb_run_ids=tuple(run_ids),
+            # A run that finished with a declared non-zero code keeps the tail
+            # that says why, as a gate that exits 3 on a failed check does.
             error_tail=(
                 error_tail.decode(errors="ignore")
-                if state is not TrainingState.FINISHED
+                if state is not TrainingState.FINISHED or exit_code != 0
                 else ""
             ),
             last_log_line=_last_log_line(error_tail),

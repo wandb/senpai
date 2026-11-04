@@ -999,6 +999,29 @@ def test_status_wait_is_bounded_by_the_schema():
             GetTrainingStatusAction(training_id="t", wait_seconds=value)
 
 
+def test_training_observation_shows_declared_exit_codes_only_when_set(tmp_path: Path):
+    declared = finished_result(tmp_path).model_copy(
+        update={"exit_code": 3, "expected_exit_codes": (0, 3)}
+    )
+
+    shown = json.loads(
+        TrainingResultObservation.from_result(declared, None).to_llm_content[0].text
+    )
+    plain = json.loads(
+        TrainingResultObservation.from_result(finished_result(tmp_path), None)
+        .to_llm_content[0].text
+    )
+
+    assert (shown["exit_code"], shown["expected_exit_codes"]) == (3, [0, 3])
+    assert "expected_exit_codes" not in plain
+    assert RunTrainingAction(
+        spec=TrainingSpec(
+            argv=("python", "gate.py"), cwd=tmp_path, timeout_seconds=5,
+            expected_exit_codes=(0, 3),
+        )
+    ).spec.expected_exit_codes == (0, 3)
+
+
 def test_log_stall_interval_defaults_to_half_an_hour():
     from senpai_agent.training import DEFAULT_LOG_STALL_SECONDS, log_stall_seconds
 

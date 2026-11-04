@@ -643,24 +643,42 @@ push. Marker comments are trusted only when authored by the authenticated token
 actor.
 
 Before posting, `post_assignment_comment` and `submit_experiment_result` check
-the identifiers the student quotes. A W&B run id counts when it is in a run
-page URL, in a table column whose header names runs, or within a few words of
-`run`, `W&B` or `wandb` in the same clause; it must be in the student's
-training records or in the run's W&B project. A run-shaped token within reach
-of `job`, `check`, `official`, `scored`, `submission` or `judge` is a judge's
-or job system's id, not a W&B run, and is not looked up. A commit SHA counts
-when it is 40 hexadecimal characters, or an abbreviated SHA near a commit
-word; it must resolve in the assignment worktree or, when the worktree has
-not fetched it, in the repository on GitHub, so a peer's PR head counts. A
-token whose nearest context word names a file digest (`SHA-256`, `sha256`,
-`digest`, `checksum`, `file`) is neither a commit nor a run; the `SHA` of
-`SHA-256` is not a commit word. A state word in the same clause as a run
-id must match the run's state class (running, finished, or stopped). The
-record vouches for the state only of the last W&B run of a terminal process;
-otherwise W&B does. Bare numbers are never SHAs. A refusal names the
-identifier and how to cite one the checks cannot see, by URL. A failed W&B or
-GitHub lookup refuses the call as unchecked, so nothing unverified is
-published.
+the identifiers the student quotes. The nearest context word within a few
+words of a token, in the same clause or its table column header, gives it a
+class, and each class has its own source. A W&B run id (in a run page URL, a
+run column, or after `run`, `W&B` or `wandb`) must be in the student's
+training records or in the run's W&B project. A commit (after `commit`,
+`SHA`, `HEAD` or a similar word) must resolve in the assignment worktree or,
+when the worktree has not fetched it, in the repository on GitHub, so a
+peer's PR head counts. A file digest (after `SHA-256`, `sha256sum`, `digest`
+or `checksum`, or any 64-hex token) must have been printed by a tool
+in the conversation, exactly or as a prefix of a printed digest; the `SHA` of
+`SHA-256` is not a commit word. A git object id (after `blob`, `hash-object`
+or `ls-tree`) must be in that tool output or an object of the worktree. A
+training id (after `training`) must be a prefix of a run record's id; a
+prefix shared by several records passes, and `training run <run-shaped id>`
+is checked as a W&B run. A
+run-shaped token within reach of `job`, `check`, `official`, `scored`,
+`submission` or `judge` belongs to a judge or job system and is not looked
+up. A hexadecimal token of seven or more characters with no label must have
+been printed by a tool, start a run record or recorded run id, or resolve as
+a commit. The tool output of a conversation is every observation and every
+delivered message, minus the tokens of the action an observation answers, so
+an echoed command or edited file does not vouch for what the agent typed; a
+tool error quoting the agent's call does not count; a new conversation starts
+with an empty index; and the system prompt, including `program.md`, is not
+tool output. A state word in the same clause
+as a run id must match the run's state class (running, finished, or stopped);
+a counted outcome such as `0 failed` or `failed=0` is not a state. The record
+vouches for the state only of the last W&B run of a terminal process;
+otherwise W&B does. A run supervised in the student pod whose launch
+declared `expected_exit_codes` (which must include 0) is recorded as finished
+when it exits with one of them, keeping its error tail; the record then does
+not vouch for the W&B run's state, W&B does. A remote launch refuses the
+field. Bare numbers are never
+SHAs. Every refusal names the class of the identifier and how to fix it. A
+failed W&B or GitHub lookup refuses the call as unchecked, so nothing
+unverified is published.
 `push_experiment_commit` and `submit_experiment_result` resolve abbreviated
 SHAs to the full commit before their other checks, and push and report the
 full SHA. `post_peer_comment` and `broadcast_message` are not checked.
