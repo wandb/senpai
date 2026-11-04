@@ -19,7 +19,7 @@ from typing import BinaryIO, Literal
 import psutil
 from pydantic import BaseModel, ConfigDict, Field
 
-from senpai_agent.worktree_snapshot import WorktreeSnapshot
+from senpai_agent.worktree_snapshot import NAMED_PATHS, WorktreeSnapshot
 from senpai_agent.processes import signal_process_group, terminate_process_group
 
 # W&B prints a run's page as <host>/<entity>/<project>/runs/<id>, on wandb.ai
@@ -232,7 +232,10 @@ class TrainingResult(BaseModel):
     # refs/senpai/snapshots/<sha> in the assignment worktree; None when the
     # worktree held no untracked files.
     worktree_snapshot: str | None = None
+    # The first NAMED_PATHS untracked paths and how many there were; the
+    # snapshot commit's message holds them all.
     untracked_paths: tuple[str, ...] = ()
+    untracked_count: int = 0
 
 
 def training_result_paths(state_dir: Path) -> Iterator[Path]:
@@ -271,7 +274,8 @@ def worktree_record_fields(worktree: WorktreeSnapshot | None) -> dict[str, objec
     return {
         "source_commit": worktree.head_sha,
         "worktree_snapshot": worktree.snapshot_sha,
-        "untracked_paths": worktree.untracked_paths,
+        "untracked_paths": worktree.untracked_paths[:NAMED_PATHS],
+        "untracked_count": len(worktree.untracked_paths),
     }
 
 

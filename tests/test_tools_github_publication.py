@@ -104,6 +104,8 @@ def test_push_experiment_commit_without_submitting_or_releasing_hold(publication
     before = deepcopy(case.fake.pr)
     tool = publication_tool(case)
     action = publication_action(tool, case)
+    # Untracked lane output beside the code does not block a push.
+    (case.workspace / "results.json").write_text("{}\n")
 
     first = tool(action)
     replay = tool(action)

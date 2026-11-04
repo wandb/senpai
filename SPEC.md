@@ -1015,9 +1015,13 @@ timeout still delete the remote workload and persist a terminal result before
 releasing ownership.
 
 The student commits the exact implementation before an expensive launch;
-`run_training` refuses a modified tracked file by name, and records untracked
-files in a snapshot commit beside `HEAD` (`refs/senpai/snapshots/<sha>`) and in
-the run record, so lane output does not block a launch. Before reserving resources or starting a process, `run_training`
+`run_training` refuses a modified tracked file by name, and records untracked,
+not ignored files in a snapshot commit beside `HEAD`
+(`refs/senpai/snapshots/<sha>`, up to 1 MiB per file, 2,000 files and 64 MiB
+per snapshot, the rest named only) and in the run record (the first twenty
+paths and the count), so lane output does not block a launch. The refs
+accumulate for the life of the checkout. A remote worker runs from `HEAD`
+without those files, and a remote launch whose `argv` names one is refused. Before reserving resources or starting a process, `run_training`
 reads the current open WIP assignment from GitHub and checks that its revision
 maps to this conversation in `student-conversations.json`. Missing, ambiguous,
 unreadable, or superseded assignments prevent a new launch. This admission check

@@ -5,6 +5,7 @@ import pytest
 from git_workflow_support import commit_file, git, repository
 
 from senpai_agent.git_transport import GitWorkflowPreconditionError
+import senpai_agent.worktree_snapshot as worktree_snapshot
 from senpai_agent.worktree_snapshot import (
     SNAPSHOT_FILE_LIMIT_BYTES,
     SNAPSHOT_REF_PREFIX,
@@ -113,6 +114,8 @@ def test_changes_to_tracked_files_refuse_and_name_the_path(tmp_path: Path, dirty
     assert "uncommitted changes to tracked files" in message
     assert ("model.py" in message) or ("new.py" in message)
     assert "plot.png" not in message
+    assert "git checkout -- <path>" in message
+    assert "git restore --staged <path>" in message
     assert "Untracked files do not block" in message
     assert git(workspace, "for-each-ref", SNAPSHOT_REF_PREFIX) == ""
 
@@ -126,6 +129,78 @@ def test_tracked_change_check_names_at_most_twenty_paths(tmp_path: Path):
 
     with pytest.raises(GitWorkflowPreconditionError, match="file19.py and 5 more"):
         require_tracked_changes_committed(workspace)
+
+
+def test_the_snapshot_budget_names_the_rest_and_skips_unreadable_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace, _remote, _head = repository(tmp_path)
+    for name in ("a.txt", "b.txt", "c.txt", "d.txt"):
+        (workspace / name).write_text(f"{name}\n")
+    (workspace / "secret.txt").write_text("x\n")
+    (workspace / "secret.txt").chmod(0)
+    (workspace / "link.txt").symlink_to("missing-target")
+    monkeypatch.setattr(worktree_snapshot, "SNAPSHOT_FILE_LIMIT_COUNT", 3)
+
+    try:
+        snapshot = snapshot_training_worktree(workspace)
+    finally:
+        (workspace / "secret.txt").chmod(0o600)
+
+    stored = git(workspace, "ls-tree", "-r", "--name-only", snapshot.snapshot_sha).split()
+    assert [path for path in stored if path != "model.py"] == ["a.txt", "b.txt", "c.txt"]
+    assert "secret.txt" in snapshot.untracked_paths
+    message = git(workspace, "log", "-1", "--format=%B", snapshot.snapshot_sha)
+    named_only = message.split("Named only")[1]
+    assert "budget of 3 files" in named_only
+    assert "d.txt" in named_only and "link.txt" in named_only and "secret.txt" in named_only
+
+    monkeypatch.setattr(worktree_snapshot, "SNAPSHOT_FILE_LIMIT_COUNT", 2000)
+    monkeypatch.setattr(worktree_snapshot, "SNAPSHOT_TOTAL_LIMIT_BYTES", 20)
+    budgeted = snapshot_training_worktree(workspace)
+    stored = git(workspace, "ls-tree", "-r", "--name-only", budgeted.snapshot_sha).split()
+    # Six bytes each: three files fill the byte budget, the symlink's 14-byte
+    # target does not fit, and the two-byte secret, readable again, does.
+    assert [path for path in stored if path != "model.py"] == [
+        "a.txt", "b.txt", "c.txt", "secret.txt"
+    ]
+
+    monkeypatch.setattr(worktree_snapshot, "SNAPSHOT_TOTAL_LIMIT_BYTES", 64 << 20)
+    unbounded = snapshot_training_worktree(workspace)
+    # A symlink is stored as a link whatever its target.
+    assert git(workspace, "ls-tree", unbounded.snapshot_sha, "link.txt").startswith("120000")
+
+
+def test_a_file_removed_during_the_snapshot_is_listed_again_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    workspace, _remote, _head = repository(tmp_path)
+    (workspace / "kept.txt").write_text("kept\n")
+    (workspace / "temp.bin").write_text("temp\n")
+    real_size = worktree_snapshot._stored_size
+
+    def vanish_after_sizing(path: Path):
+        size = real_size(path)
+        if path.name == "temp.bin" and path.exists():
+            path.unlink()
+        return size
+
+    monkeypatch.setattr(worktree_snapshot, "_stored_size", vanish_after_sizing)
+
+    snapshot = snapshot_training_worktree(workspace)
+
+    assert snapshot.untracked_paths == ("kept.txt",)
+    stored = git(workspace, "ls-tree", "-r", "--name-only", snapshot.snapshot_sha).split()
+    assert "kept.txt" in stored and "temp.bin" not in stored
+
+    (workspace / "ghost.txt").write_text("ghost\n")
+    monkeypatch.setattr(
+        worktree_snapshot, "_untracked_paths", lambda workspace: ("ghost.txt", "kept.txt")
+    )
+    (workspace / "ghost.txt").unlink()
+    monkeypatch.setattr(worktree_snapshot, "_stored_size", lambda path: 6)
+    with pytest.raises(GitWorkflowPreconditionError, match="changed while.*call run_training again"):
+        snapshot_training_worktree(workspace)
 
 
 def test_snapshot_requires_a_git_worktree(tmp_path: Path):

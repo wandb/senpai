@@ -154,7 +154,7 @@ def test_student_stop_allows_durable_monitored_training(
     state_dir = tmp_path / "state"
     write_running_training(state_dir, monitored=True)
     monkeypatch.setattr(
-        "senpai_agent.hooks.run_git",
+        "senpai_agent.worktree_snapshot._git",
         lambda *_args, **_kwargs: "",
     )
 
@@ -185,7 +185,7 @@ def test_student_stop_ignores_non_training_json_sidecars(
         '{"metrics": {}, "passed": true, "score": 1.0}'
     )
     monkeypatch.setattr(
-        "senpai_agent.hooks.run_git",
+        "senpai_agent.worktree_snapshot._git",
         lambda *_args, **_kwargs: "",
     )
 
@@ -209,7 +209,7 @@ def test_student_stop_denies_a_modified_tracked_file_and_names_it(
     capsys: pytest.CaptureFixture[str],
 ):
     monkeypatch.setattr(
-        "senpai_agent.hooks.run_git",
+        "senpai_agent.worktree_snapshot._git",
         lambda *_args, **_kwargs: " M model.py\nA  helper.py\n",
     )
 
@@ -223,7 +223,8 @@ def test_student_stop_denies_a_modified_tracked_file_and_names_it(
 
     assert (exit_code, output["decision"]) == (2, "deny")
     assert "model.py, helper.py" in output["reason"]
-    assert "Untracked files may stay" in output["reason"]
+    assert "git restore --staged <path>" in output["reason"]
+    assert "Untracked files do not block. Commit before finishing." in output["reason"]
 
 
 def test_student_stop_allows_untracked_lane_output(
@@ -239,7 +240,7 @@ def test_student_stop_allows_untracked_lane_output(
         # would still list them.
         return "" if "--untracked-files=no" in arguments else "?? lane/plot.png\n"
 
-    monkeypatch.setattr("senpai_agent.hooks.run_git", run_git)
+    monkeypatch.setattr("senpai_agent.worktree_snapshot._git", run_git)
 
     exit_code, output = invoke_hook(
         "stop",
@@ -250,7 +251,10 @@ def test_student_stop_allows_untracked_lane_output(
     )
 
     assert (exit_code, output["decision"]) == (0, "allow")
-    assert calls == [("status", "--porcelain", "--untracked-files=no")]
+    assert calls == [
+        ("rev-parse", "--is-inside-work-tree"),
+        ("status", "--porcelain", "--untracked-files=no"),
+    ]
 
 
 def test_queued_feedback_temporarily_allows_a_clean_unwind(
@@ -263,7 +267,7 @@ def test_queued_feedback_temporarily_allows_a_clean_unwind(
     state_dir.mkdir()
     queued_feedback_marker(state_dir).touch()
     monkeypatch.setattr(
-        "senpai_agent.hooks.run_git",
+        "senpai_agent.worktree_snapshot._git",
         lambda *_args, **_kwargs: " M model.py\n",
     )
 

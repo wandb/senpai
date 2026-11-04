@@ -179,7 +179,8 @@ class PushExperimentCommitTool(
         return _tool(
             cls, PushExperimentCommitAction, "Push experiment commit",
             "Push the exact current local commit (HEAD) to the existing GitHub branch for "
-            "this student's experiment PR. There must be no uncommitted changes. "
+            "this student's experiment PR. Tracked files must be committed; "
+            "untracked files may remain. "
             "The PR must be open and marked work in progress (status:wip). Supply "
             "the PR number, assignment ID, current instruction revision ID, "
             "current GitHub PR head and local Git commit identifiers (SHAs). "

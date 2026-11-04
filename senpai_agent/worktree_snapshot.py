@@ -9,6 +9,7 @@ inputs of a run stay inspectable without joining the assignment branch.
 
 from __future__ import annotations
 
+import os
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,10 +18,14 @@ from senpai_agent.git_transport import GitWorkflowPreconditionError, run_git as 
 
 
 # Untracked files up to this size are stored in a worktree snapshot. Larger
-# files, such as checkpoints, profiles and built extensions, are named only.
+# files, such as checkpoints, profiles and built extensions, are named only,
+# as is everything past the file and byte budget of one snapshot.
 SNAPSHOT_FILE_LIMIT_BYTES = 1 << 20
+SNAPSHOT_FILE_LIMIT_COUNT = 2000
+SNAPSHOT_TOTAL_LIMIT_BYTES = 64 << 20
 SNAPSHOT_REF_PREFIX = "refs/senpai/snapshots/"
-_NAMED_PATHS = 20
+# Paths named in a message, an observation or a run record.
+NAMED_PATHS = 20
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,9 +57,10 @@ def require_tracked_changes_committed(workspace: Path) -> None:
         paths = [line.split(maxsplit=1)[-1] for line in status.splitlines()]
         raise GitWorkflowPreconditionError(
             "assignment worktree has uncommitted changes to tracked files: "
-            f"{_name_paths(paths)}. Commit the exact implementation that will "
-            "run, or discard an incidental change with `git checkout -- <path>`. "
-            "Untracked files do not block."
+            f"{name_paths(paths)}. Commit the exact implementation that will "
+            "run, discard an incidental change with `git checkout -- <path>`, or "
+            "unstage a new file with `git restore --staged <path>`. Untracked "
+            "files do not block."
         )
 
 
@@ -65,49 +71,38 @@ def snapshot_training_worktree(workspace: Path) -> WorktreeSnapshot:
     whose ref is ``refs/senpai/snapshots/<sha>``, so the exact inputs of a run
     can be inspected later with ``git show --stat <sha>``. The commit never
     joins the assignment branch. Identical worktrees produce the same
-    snapshot commit.
+    snapshot commit. The refs accumulate for the life of the checkout, one per
+    distinct worktree state.
     """
 
     workspace = Path(workspace).resolve()
     require_tracked_changes_committed(workspace)
     head = _git(workspace, "rev-parse", "--verify", "HEAD^{commit}")
-    untracked = tuple(
-        path
-        for path in _git(
-            workspace, "ls-files", "--others", "--exclude-standard", "-z"
-        ).split("\0")
-        if path
-    )
-    if not untracked:
-        return WorktreeSnapshot(head, (), None)
-    # A path ending in "/" is a nested repository, which git cannot add as
-    # files; a file a running process has already removed cannot be stored.
-    stored = [
-        path
-        for path in untracked
-        if not path.endswith("/") and _stored_size(workspace / path) is not None
-    ]
-    named_only = [path for path in untracked if path not in stored]
-    with tempfile.NamedTemporaryFile(prefix="senpai-snapshot-index-") as index:
-        index_env = {"GIT_INDEX_FILE": index.name}
-        _git(workspace, "read-tree", head, extra_env=index_env)
-        if stored:
-            _git(
-                workspace,
-                "--literal-pathspecs",
-                "add",
-                "--pathspec-from-file=-",
-                "--pathspec-file-nul",
-                input_text="".join(f"{path}\0" for path in stored),
-                extra_env=index_env,
-            )
-        tree = _git(workspace, "write-tree", extra_env=index_env)
+    for attempt in (1, 2):
+        untracked = _untracked_paths(workspace)
+        if not untracked:
+            return WorktreeSnapshot(head, (), None)
+        stored = _within_budget(workspace, untracked)
+        try:
+            tree = _snapshot_tree(workspace, head, stored)
+            break
+        except GitWorkflowPreconditionError as error:
+            # A running process replaced or removed a file between the listing
+            # and the add; a fresh listing covers it once.
+            if attempt == 2:
+                raise GitWorkflowPreconditionError(
+                    "the worktree changed while its untracked files were being "
+                    f"snapshotted ({error}); call run_training again"
+                ) from error
+    named_only = [path for path in untracked if path not in set(stored)]
     message = "Senpai worktree snapshot: HEAD plus the untracked files present at launch\n"
     if stored:
         message += "\nStored:\n" + "".join(f"  {path}\n" for path in stored)
     if named_only:
         message += (
-            f"\nNamed only (nested repository or over {SNAPSHOT_FILE_LIMIT_BYTES} bytes):\n"
+            "\nNamed only (nested repository, unreadable, over "
+            f"{SNAPSHOT_FILE_LIMIT_BYTES} bytes, or beyond the budget of "
+            f"{SNAPSHOT_FILE_LIMIT_COUNT} files and {SNAPSHOT_TOTAL_LIMIT_BYTES} bytes):\n"
             + "".join(f"  {path}\n" for path in named_only)
         )
     date = _git(workspace, "log", "-1", "--format=%cI", head)
@@ -126,16 +121,61 @@ def snapshot_training_worktree(workspace: Path) -> WorktreeSnapshot:
     return WorktreeSnapshot(head, untracked, snapshot)
 
 
+def _untracked_paths(workspace: Path) -> tuple[str, ...]:
+    """Untracked, not ignored paths; a nested repository ends in a slash."""
+
+    listing = _git(workspace, "ls-files", "--others", "--exclude-standard", "-z")
+    return tuple(path for path in listing.split("\0") if path)
+
+
+def _within_budget(workspace: Path, untracked: tuple[str, ...]) -> list[str]:
+    stored: list[str] = []
+    total = 0
+    for path in untracked:
+        if len(stored) >= SNAPSHOT_FILE_LIMIT_COUNT:
+            break
+        if path.endswith("/"):
+            continue
+        size = _stored_size(workspace / path)
+        if size is None or total + size > SNAPSHOT_TOTAL_LIMIT_BYTES:
+            continue
+        stored.append(path)
+        total += size
+    return stored
+
+
+def _snapshot_tree(workspace: Path, head: str, stored: list[str]) -> str:
+    with tempfile.NamedTemporaryFile(prefix="senpai-snapshot-index-") as index:
+        index_env = {"GIT_INDEX_FILE": index.name}
+        _git(workspace, "read-tree", head, extra_env=index_env)
+        if stored:
+            _git(
+                workspace,
+                "--literal-pathspecs",
+                "add",
+                "--pathspec-from-file=-",
+                "--pathspec-file-nul",
+                input_text="".join(f"{path}\0" for path in stored),
+                extra_env=index_env,
+            )
+        return _git(workspace, "write-tree", extra_env=index_env)
+
+
 def _stored_size(path: Path) -> int | None:
+    """Size of a file the snapshot can store; None names it only."""
+
     try:
         size = path.lstat().st_size
     except FileNotFoundError:
         return None
+    # git stores a symlink's target, so the link itself need not resolve.
+    if not path.is_symlink() and not os.access(path, os.R_OK):
+        return None
     return size if size <= SNAPSHOT_FILE_LIMIT_BYTES else None
 
 
-def _name_paths(paths: list[str]) -> str:
-    named = ", ".join(paths[:_NAMED_PATHS])
-    if len(paths) > _NAMED_PATHS:
-        named += f" and {len(paths) - _NAMED_PATHS} more"
+def name_paths(paths: list[str]) -> str:
+    named = ", ".join(paths[:NAMED_PATHS])
+    if len(paths) > NAMED_PATHS:
+        named += f" and {len(paths) - NAMED_PATHS} more"
     return named

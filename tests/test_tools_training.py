@@ -418,14 +418,12 @@ def test_run_training_starts_with_untracked_lane_output_and_records_it(
 
 
 def test_training_observation_names_untracked_files_and_the_snapshot(tmp_path: Path):
+    from senpai_agent.training import worktree_record_fields
+    from senpai_agent.worktree_snapshot import WorktreeSnapshot
+
     paths = tuple(f"lane/out-{index:02d}.json" for index in range(25))
-    result = finished_result(tmp_path).model_copy(
-        update={
-            "source_commit": "a" * 40,
-            "worktree_snapshot": "b" * 40,
-            "untracked_paths": paths,
-        }
-    )
+    fields = worktree_record_fields(WorktreeSnapshot("a" * 40, paths, "b" * 40))
+    result = finished_result(tmp_path).model_copy(update=fields)
 
     delivered = json.loads(
         TrainingResultObservation.from_result(result, None).to_llm_content[0].text
@@ -433,9 +431,13 @@ def test_training_observation_names_untracked_files_and_the_snapshot(tmp_path: P
 
     assert delivered["source_commit"] == "a" * 40
     assert delivered["worktree_snapshot"] == "b" * 40
+    # The record keeps the first twenty paths and the count; the snapshot
+    # commit message names them all.
+    assert result.untracked_paths == paths[:20]
     assert delivered["untracked_paths"] == list(paths[:20])
     assert delivered["untracked_count"] == 25
     assert "git show --stat " + "b" * 40 in delivered["worktree_note"]
+    assert "commit any file the result depends on before submitting" in delivered["worktree_note"]
 
     clean = json.loads(
         TrainingResultObservation.from_result(
@@ -444,6 +446,29 @@ def test_training_observation_names_untracked_files_and_the_snapshot(tmp_path: P
     )
     assert "untracked_paths" not in clean
     assert "worktree_note" not in clean
+
+
+def test_a_remote_runs_note_says_the_worker_ran_without_the_untracked_files(tmp_path: Path):
+    from senpai_agent.training import KubernetesTrainingSpec
+
+    result = finished_result(tmp_path).model_copy(
+        update={
+            "source_commit": "a" * 40,
+            "worktree_snapshot": "b" * 40,
+            "untracked_paths": ("configs/sweep.yaml",),
+            "untracked_count": 1,
+            "kubernetes_spec": KubernetesTrainingSpec(
+                kind="Job", name="senpai-fred-fern-1", namespace="research", wandb_run_id="r1"
+            ),
+        }
+    )
+
+    delivered = json.loads(
+        TrainingResultObservation.from_result(result, None).to_llm_content[0].text
+    )
+
+    assert "The worker ran from source_commit without them" in delivered["worktree_note"]
+    assert "commit it and launch again" in delivered["worktree_note"]
 
 
 def test_run_training_requires_a_conversation_before_starting(

@@ -10,9 +10,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from senpai_agent.git_transport import run_git
+from senpai_agent.git_transport import GitWorkflowPreconditionError
 from senpai_agent.secrets import SHELL_STARTUP_ENV_NAMES
 from senpai_agent.training import training_result_paths
+from senpai_agent.worktree_snapshot import require_tracked_changes_committed
 
 
 QUEUED_FEEDBACK_MARKER = "queued-feedback-pending"
@@ -1493,19 +1494,12 @@ def _stop_policy(
                 f"{', '.join(sorted(unmonitored))}",
             )
     if require_clean_workspace:
-        # Untracked files, such as results and scratch scripts, may stay; a
-        # modified tracked file means no commit reproduces the work.
-        status = run_git(working_dir, "status", "--porcelain", "--untracked-files=no")
-        if status:
-            paths = [line.split(maxsplit=1)[-1] for line in status.splitlines()]
-            return PolicyDecision(
-                False,
-                "Uncommitted changes to tracked files: "
-                f"{', '.join(paths[:20])}. Commit the exact implementation "
-                "before training, or discard an incidental change with "
-                "`git checkout -- <path>`, before finishing. Untracked files "
-                "may stay.",
-            )
+        # The same rule as run_training and push_experiment_commit: untracked
+        # files may stay, a modified tracked file may not.
+        try:
+            require_tracked_changes_committed(working_dir)
+        except GitWorkflowPreconditionError as error:
+            return PolicyDecision(False, f"{error} Commit before finishing.")
     return PolicyDecision(True)
 
 

@@ -113,7 +113,8 @@ class PushExperimentCommitAction(Action):
         min_length=1,
         description=(
             "Exact Git commit identifier (SHA) to push. It must equal the current "
-            "local commit (HEAD), and there must be no uncommitted changes."
+            "local commit (HEAD); tracked files must be committed, untracked files "
+            "may remain."
         ),
     )
 
