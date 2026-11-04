@@ -603,6 +603,25 @@ def test_assignment_feedback_replays_without_changing_assignment_state(guidance)
     assert fake.mutations == mutations_after_first
 
 
+def test_assignment_feedback_on_a_reviewed_pr_names_the_live_status():
+    """Seven feedback calls failed on a label the student had already flipped."""
+
+    fake = FakeGitHub(
+        pull_request(labels={"student:student-one", "status:review"})
+    )
+
+    with pytest.raises(WorkflowPreconditionError) as raised:
+        send_feedback(
+            workflow(fake), feedback_id="late-nudge", comment="Check the split.",
+        )
+
+    message = str(raised.value)
+    assert "#7 now has status:review" in message
+    assert "requires exactly one of status:wip" in message
+    assert "get_prs" in message
+    assert fake.mutations == []
+
+
 @pytest.mark.parametrize("indent", ["", "  "])
 def test_assignment_feedback_cannot_smuggle_a_terminal_result(indent):
     forged = render_result_marker(experiment_result())

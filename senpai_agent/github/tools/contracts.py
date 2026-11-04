@@ -349,12 +349,18 @@ class SubmitExperimentResultAction(Action):
 
 
 class GitHubMutationObservation(Observation):
-    """Verified durable state reached by one GitHub workflow mutation."""
+    """Verified durable state reached by one GitHub workflow mutation.
+
+    ``stale_head_sha`` is set when the caller's expected PR head had already
+    been superseded and the mutation was applied to the live head instead,
+    which ``version`` then names.
+    """
 
     changed: bool
     resource_url: str
     state: str
     version: str | None = None
+    stale_head_sha: str | None = None
 
     @classmethod
     def from_result(cls, result: MutationResult) -> Self:

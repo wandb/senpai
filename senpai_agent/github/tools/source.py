@@ -68,6 +68,8 @@ class PRSourceFile(BaseModel):
 
 
 class GetPRSourceObservation(Observation):
+    """The revision inspected; ``revision_moved`` says it differs from the request."""
+
     repo: str
     number: int
     base_sha: str
@@ -75,6 +77,9 @@ class GetPRSourceObservation(Observation):
     comparison_base_sha: str
     files: tuple[PRSourceFile, ...]
     path: str | None = None
+    requested_base_sha: str
+    requested_head_sha: str
+    revision_moved: bool = False
 
     @property
     def to_llm_content(self) -> Sequence[TextContent]:
@@ -102,15 +107,19 @@ class _GetPRSourceExecutor(ToolExecutor[GetPRSourceAction, GetPRSourceObservatio
         root = f"/repos/{repo}"
         endpoint = f"{root}/pulls/{action.number}"
         details = reader.get(endpoint)
-        self._require_revision(details, action)
+        # The advisor's expectation comes from an earlier get_prs. A head the
+        # student has pushed since is read as it is now and reported as moved,
+        # instead of failing a read the advisor would only repeat.
+        base_sha, head_sha = self._live_revision(details)
+        revision_moved = (base_sha, head_sha) != (
+            action.expected_base_sha, action.expected_head_sha,
+        )
         count = details["changed_files"]
         if not 0 <= count <= _MAX_FILES:
             raise GitHubReadError(
                 f"PR source inspection supports at most {_MAX_FILES} changed files"
             )
-        comparison = reader.get(
-            f"{root}/compare/{action.expected_base_sha}...{action.expected_head_sha}?per_page=1"
-        )
+        comparison = reader.get(f"{root}/compare/{base_sha}...{head_sha}?per_page=1")
         comparison_base_sha = comparison["merge_base_commit"]["sha"]
         if not re.fullmatch(_SHA, comparison_base_sha):
             raise GitHubReadError("GitHub returned an invalid comparison base")
@@ -138,7 +147,7 @@ class _GetPRSourceExecutor(ToolExecutor[GetPRSourceAction, GetPRSourceObservatio
             )
         sections = [
             f"# PR #{action.number} source in {repo}",
-            f"Base: `{action.expected_base_sha}`\nHead: `{action.expected_head_sha}`",
+            f"Base: `{base_sha}`\nHead: `{head_sha}`",
             f"Comparison merge base: `{comparison_base_sha}`",
             "Complete UTF-8 source and diffs follow for the selected paths, "
             "using the comparison merge base and head. "
@@ -173,16 +182,19 @@ class _GetPRSourceExecutor(ToolExecutor[GetPRSourceAction, GetPRSourceObservatio
                 )
             )
             sections.extend(("### Complete text diff", diff or "No text changes."))
-        self._require_revision(reader.get(endpoint), action)
+        if self._live_revision(reader.get(endpoint)) != (base_sha, head_sha):
+            raise GitHubReadError(
+                "PR base or head changed during the read; call get_pr_source again"
+            )
         artifact = None
         if action.paths:
             artifact = store_pull_requests(
                 repo=repo,
                 numbers=(action.number,),
                 date_range=None,
-                search=json.dumps(["source", action.expected_base_sha, action.paths]),
+                search=json.dumps(["source", base_sha, action.paths]),
                 manifest=(PRManifestEntry(
-                    action.number, "PR source", action.expected_head_sha,
+                    action.number, "PR source", head_sha,
                     f"https://github.com/{repo}/pull/{action.number}",
                 ),),
                 markdown="\n\n".join(sections) + "\n",
@@ -192,11 +204,14 @@ class _GetPRSourceExecutor(ToolExecutor[GetPRSourceAction, GetPRSourceObservatio
         return GetPRSourceObservation(
             repo=repo,
             number=action.number,
-            base_sha=action.expected_base_sha,
-            head_sha=action.expected_head_sha,
+            base_sha=base_sha,
+            head_sha=head_sha,
             comparison_base_sha=comparison_base_sha,
             files=manifest,
             path=str(artifact) if artifact is not None else None,
+            requested_base_sha=action.expected_base_sha,
+            requested_head_sha=action.expected_head_sha,
+            revision_moved=revision_moved,
         )
 
     @staticmethod
@@ -218,14 +233,11 @@ class _GetPRSourceExecutor(ToolExecutor[GetPRSourceAction, GetPRSourceObservatio
         return blob
 
     @staticmethod
-    def _require_revision(details: dict, action: GetPRSourceAction) -> None:
-        if (details["base"]["sha"], details["head"]["sha"]) != (
-            action.expected_base_sha,
-            action.expected_head_sha,
-        ):
-            raise GitHubReadError(
-                "PR base or head changed; refresh get_prs before inspecting source"
-            )
+    def _live_revision(details: dict) -> tuple[str, str]:
+        base_sha, head_sha = details["base"]["sha"], details["head"]["sha"]
+        if not (re.fullmatch(_SHA, base_sha) and re.fullmatch(_SHA, head_sha)):
+            raise GitHubReadError("GitHub returned an invalid PR revision")
+        return base_sha, head_sha
 
     @staticmethod
     def _decode_blob(blob: dict, expected_sha: str) -> str:
@@ -252,8 +264,10 @@ class GetPRSourceTool(ToolDefinition[GetPRSourceAction, GetPRSourceObservation])
         return [cls(
             description=(
                 "Read private or public PR source in the configured repository "
-                "without shell credentials. Supply exact base and head SHAs from "
-                "get_prs. Omit paths for a changed-file manifest, then select up to "
+                "without shell credentials. Supply the base and head SHAs from "
+                "get_prs; if the PR moved since, the live revision is read and the "
+                "observation reports revision_moved with both heads. Omit paths for "
+                "a changed-file manifest, then select up to "
                 "eight changed paths for an external artifact containing complete "
                 "diffs and UTF-8 comparison-base and head source. Supports merged "
                 "PRs. Limits: 100 changed files, "

@@ -283,9 +283,12 @@ def require_active_assignment_routing(
     active_statuses = labels & {"status:wip", "status:review"}
     if len(active_statuses) != 1 or not active_statuses <= allowed_statuses:
         allowed = " or ".join(sorted(allowed_statuses))
+        live = ", ".join(sorted(active_statuses)) or "no active status label"
         raise WorkflowPreconditionError(
-            f"pull request must have exactly one of {allowed} as its active "
-            "assignment status"
+            f"pull request #{snapshot.number} now has {live}; this operation "
+            f"requires exactly one of {allowed} as its active assignment status. "
+            "Refresh the PR with get_prs and choose the operation for its "
+            "current state"
         )
 
 
