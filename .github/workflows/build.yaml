@@ -11,12 +11,43 @@ env:
   SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      roles: ${{ steps.roles.outputs.roles }}
+    steps:
+      - name: Choose the images to build
+        id: roles
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_FILES: repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files
+          STUDENT_INPUTS: '^(Dockerfile\.student$|pyproject\.toml$|uv\.lock$|scripts/|\.github/workflows/build\.yaml$)'
+        run: |
+          # The student image differs from the advisor image by its CUDA base and
+          # training stack, and pulling that base takes longer than every other
+          # check. A pull request that leaves the student's own inputs alone is
+          # validated by the advisor build and skips the student build.
+          roles='["advisor", "student", "executor", "cutoff"]'
+          if [ "$EVENT_NAME" = pull_request ]; then
+            changed=$(gh api --paginate "$PULL_REQUEST_FILES" --jq '.[].filename')
+            if ! grep -qE "$STUDENT_INPUTS" <<< "$changed"; then
+              roles='["advisor", "executor", "cutoff"]'
+            fi
+          fi
+          echo "Building $roles"
+          echo "roles=$roles" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: plan
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        role: [advisor, student, executor, cutoff]
+        role: ${{ fromJSON(needs.plan.outputs.roles) }}
     env:
       IMAGE_NAME: ${{ github.repository }}-${{ matrix.role }}
     permissions:

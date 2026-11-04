@@ -230,10 +230,12 @@ def test_build_workflow_builds_all_images_from_the_exact_checked_out_commit():
     workflow = yaml.safe_load(source)
     events = yaml.load(source, Loader=yaml.BaseLoader)["on"]
     build = workflow["jobs"]["build"]
-    roles = build["strategy"]["matrix"]["role"]
     steps = {step["name"]: step for step in build["steps"]}
 
-    assert set(roles) == {"advisor", "student", "executor", "cutoff"}
+    assert build["needs"] == "plan"
+    assert build["strategy"]["matrix"]["role"] == (
+        "${{ fromJSON(needs.plan.outputs.roles) }}"
+    )
     assert events["pull_request"] == {}
     assert workflow["env"]["SOURCE_REVISION"] == (
         "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -253,6 +255,67 @@ def test_build_workflow_builds_all_images_from_the_exact_checked_out_commit():
         "SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}"
         in build_inputs["build-args"]
     )
+
+
+ALL_IMAGES = ["advisor", "student", "executor", "cutoff"]
+
+
+@pytest.mark.parametrize(
+    ("event", "changed", "expected"),
+    [
+        ("push", [], ALL_IMAGES),
+        ("workflow_dispatch", [], ALL_IMAGES),
+        (
+            "pull_request",
+            ["senpai_agent/controller.py", "plugins/senpai/SKILL.md", "Dockerfile.advisor"],
+            ["advisor", "executor", "cutoff"],
+        ),
+        ("pull_request", ["Dockerfile.student"], ALL_IMAGES),
+        ("pull_request", ["uv.lock"], ALL_IMAGES),
+        ("pull_request", ["pyproject.toml"], ALL_IMAGES),
+        ("pull_request", ["scripts/senpai-gpu-smoke-test.py"], ALL_IMAGES),
+        ("pull_request", [".github/workflows/build.yaml"], ALL_IMAGES),
+    ],
+)
+def test_pull_requests_skip_the_student_image_unless_its_inputs_change(
+    tmp_path: Path,
+    event: str,
+    changed: list[str],
+    expected: list[str],
+):
+    workflow = yaml.safe_load(
+        (ROOT / ".github" / "workflows" / "build.yaml").read_text(encoding="utf-8")
+    )
+    step = workflow["jobs"]["plan"]["steps"][0]
+    assert workflow["jobs"]["plan"]["outputs"]["roles"] == (
+        f"${{{{ steps.{step['id']}.outputs.roles }}}}"
+    )
+
+    # Stand in for the GitHub API listing of the pull request's files.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    gh = bin_dir / "gh"
+    gh.write_text(
+        "#!/bin/sh\n"
+        'test "$1 $2 $3 $4" = "api --paginate repos/wandb/senpai/pulls/7/files --jq" || exit 9\n'
+        f"printf '%s\\n' {' '.join(shlex.quote(name) for name in changed)}\n"
+    )
+    gh.chmod(0o755)
+    output = tmp_path / "output"
+    output.touch()
+    env = {
+        **os.environ,
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "STUDENT_INPUTS": step["env"]["STUDENT_INPUTS"],
+        "EVENT_NAME": event,
+        "PULL_REQUEST_FILES": "repos/wandb/senpai/pulls/7/files",
+        "GITHUB_OUTPUT": str(output),
+    }
+
+    subprocess.run(["bash", "-e", "-c", step["run"]], check=True, env=env)
+
+    roles = dict(line.split("=", 1) for line in output.read_text().splitlines())
+    assert json.loads(roles["roles"]) == expected
 
 
 def test_runtime_workflow_uses_the_lockfile_uv_and_exa_versions():
