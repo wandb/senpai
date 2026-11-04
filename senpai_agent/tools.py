@@ -873,7 +873,10 @@ def register_senpai_tools() -> None:
         return
     # Every tool explains a call that fails validation with the failing field,
     # its schema and a valid example; the SDK's file editor is re-registered
-    # under its own name so the same holds for it.
+    # under its own name so the same holds for it. The SDK registers the
+    # editor when openhands.tools.file_editor is imported, which this module's
+    # top-level FileEditorTool import guarantees happens first, so the
+    # explaining class is the one the registry resolves.
     registrations = (
         ("senpai_training", TrainingToolSet),
         ("get_cluster_capacity", ClusterCapacityTool),

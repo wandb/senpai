@@ -92,7 +92,7 @@ EXAMPLES: dict[str, dict[str, Any]] = {
     },
     "FileEditorAction": {
         "command": "str_replace",
-        "path": "/workspace/senpai/problem/train.py",
+        "path": "/workspace/senpai/target/train.py",
         "old_str": "lr = 1e-3",
         "new_str": "lr = 3e-4",
     },
@@ -103,7 +103,7 @@ EXAMPLES: dict[str, dict[str, Any]] = {
     "RunTrainingAction": {
         "spec": {
             "argv": ["python", "train.py", "--config", "configs/base.yaml"],
-            "cwd": "/workspace/senpai/problem",
+            "cwd": "/workspace/senpai/target",
             "timeout_seconds": 3600,
         },
     },
@@ -158,19 +158,27 @@ class SchemaHelp:
         try:
             return super().action_from_arguments(arguments)  # type: ignore[misc]
         except ValidationError as error:
-            raise ValueError(
-                describe_validation_error(error, self.action_type)  # type: ignore[attr-defined]
-            ) from error
+            action_type = self.action_type  # type: ignore[attr-defined]
+            # A response-schema error is not about the action's own fields.
+            if error.title != action_type.__name__:
+                raise
+            raise ValueError(describe_validation_error(error, action_type)) from error
 
 
+# The SDK keys concrete ToolDefinition subclasses by class name and refuses a
+# duplicate, so each generated class gets a name of its own, which is also its
+# ``kind``. ToolDefinition derives a subclass's tool name from its class name
+# unless the subclass sets one, so each keeps the original tool's name.
 _HELPED: dict[type[ToolDefinition], type[ToolDefinition]] = {}
+_EXPLAINING: dict[type[ToolDefinition], type[ToolDefinition]] = {}
 
 
 def with_schema_help(tool: ToolDefinition) -> ToolDefinition:
     """Return the tool as an instance of its class with the SchemaHelp mixin.
 
-    The copy keeps the executor, schema and ``kind``; only the class gains
-    the mixin, which adds no fields or slots, so the layout is unchanged.
+    The copy keeps the executor, schema and name; its ``kind`` becomes
+    ``<Class>SchemaHelp``. The mixin adds no fields or slots, so the layout
+    is unchanged.
     """
 
     if isinstance(tool, SchemaHelp):
@@ -178,17 +186,8 @@ def with_schema_help(tool: ToolDefinition) -> ToolDefinition:
     cls = type(tool)
     helped = _HELPED.get(cls)
     if helped is None:
-        # ToolDefinition derives a subclass's name from its class name unless
-        # the subclass sets one; keep the original tool's name.
         helped = _HELPED[cls] = type(
-            cls.__name__,
-            (SchemaHelp, cls),
-            {
-                "__slots__": (),
-                "__module__": cls.__module__,
-                "__qualname__": cls.__qualname__,
-                "name": cls.name,
-            },
+            f"{cls.__name__}SchemaHelp", (SchemaHelp, cls), {"__slots__": (), "name": cls.name}
         )
     copied = tool.model_copy()
     object.__setattr__(copied, "__class__", helped)
@@ -200,19 +199,18 @@ def explaining_validation_errors(tool_class: type[ToolDefinition]) -> type[ToolD
 
     if issubclass(tool_class, SchemaHelp):
         return tool_class
+    explaining = _EXPLAINING.get(tool_class)
+    if explaining is None:
 
-    class Explained(SchemaHelp, tool_class):  # type: ignore[misc,valid-type]
-        __slots__ = ()
-        name = tool_class.name
-
-        @classmethod
-        def create(cls, *args: Any, **kwargs: Any):  # noqa: ANN206
+        def create(cls: type, *args: Any, **kwargs: Any) -> list[ToolDefinition]:
             return [with_schema_help(tool) for tool in tool_class.create(*args, **kwargs)]
 
-    Explained.__name__ = tool_class.__name__
-    Explained.__qualname__ = tool_class.__qualname__
-    Explained.__module__ = tool_class.__module__
-    return Explained
+        explaining = _EXPLAINING[tool_class] = type(
+            f"{tool_class.__name__}Explaining",
+            (SchemaHelp, tool_class),
+            {"__slots__": (), "name": tool_class.name, "create": classmethod(create)},
+        )
+    return explaining
 
 
 def _path(loc: tuple[Any, ...]) -> str:
@@ -249,25 +247,30 @@ def _schema_at(schema: dict[str, Any], loc: tuple[Any, ...]) -> dict[str, Any] |
 def _compact(node: dict[str, Any], schema: dict[str, Any]) -> dict[str, Any]:
     """Keep a node readable: an object lists its fields by type, not in full."""
 
+    if "items" in node:
+        return {**node, "items": _compact(_deref(node["items"], schema), schema)}
     if "properties" not in node:
         return node
     compact = {key: value for key, value in node.items() if key not in {"properties", "$defs"}}
+    # "kind" is the SDK's discriminator, never an argument the model sends.
     compact["properties"] = {
-        name: _type_name(_deref(prop, schema)) for name, prop in node["properties"].items()
+        name: _type_name(_deref(prop, schema), schema)
+        for name, prop in node["properties"].items()
+        if name != "kind"
     }
     return compact
 
 
-def _type_name(node: dict[str, Any]) -> str:
+def _type_name(node: dict[str, Any], schema: dict[str, Any]) -> str:
     if "enum" in node:
         return "enum[" + "|".join(str(value) for value in node["enum"][:6]) + "]"
     if "const" in node:
         return f"const={node['const']!r}"
     if "anyOf" in node:
-        return "|".join(_type_name(option) for option in node["anyOf"])
+        return "|".join(_type_name(_deref(option, schema), schema) for option in node["anyOf"])
     kind = node.get("type", "object")
     if kind == "array" and "items" in node:
-        return f"array[{_type_name(node['items'])}]"
+        return f"array[{_type_name(_deref(node['items'], schema), schema)}]"
     return str(kind)
 
 
