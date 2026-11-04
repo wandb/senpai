@@ -46,4 +46,4 @@ jobs:
             "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@e899135f98444f7bfe08441311a6f5e565d97b39#subdirectory=openhands-tools"
 
       - name: Test the complete control plane (no cluster)
-        run: .venv/bin/python -m pytest -n auto --durations=15
+        run: .venv/bin/python -m pytest -n logical --durations=15
