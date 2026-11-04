@@ -1,4 +1,3 @@
-import json
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -50,13 +49,17 @@ class FakeCommitLookup:
         )
 
 
-def write_record(training_dir: Path, *, state: TrainingState, run_ids=()) -> None:
+def write_record(
+    training_dir: Path, *, state: TrainingState, run_ids=(), exit_code: int | None = None
+) -> None:
+    if exit_code is None and state is not TrainingState.RUNNING:
+        exit_code = 0 if state is TrainingState.FINISHED else 1
     training_dir.mkdir(parents=True, exist_ok=True)
     (training_dir / f"{TRAINING_ID}.json").write_text(
         TrainingResult(
             training_id=TRAINING_ID,
             state=state,
-            exit_code=None if state is TrainingState.RUNNING else 1,
+            exit_code=exit_code,
             elapsed_seconds=12,
             log_path=str(training_dir / f"{TRAINING_ID}.log"),
             wandb_run_ids=tuple(run_ids),
@@ -438,6 +441,18 @@ def test_a_commit_word_nearer_than_the_digest_word_still_names_a_commit(case):
         provenance.check_text("the file at commit 0747eaa is fine", source="comment")
 
 
+def test_file_is_ordinary_prose_around_a_commit(case):
+    provenance, lookup, head = case
+    index = observed(observation("nothing printed here"))
+
+    provenance.check_text(f"the 3 files changed in {head[:8]} are small", source="comment")
+    provenance.check_text(f"the file at {head[:8]}", source="comment", observed=index)
+    with pytest.raises(ProvenanceError, match="'0747eaa0'.*has no label"):
+        provenance.check_text("the file at 0747eaa0", source="comment", observed=index)
+
+    assert lookup.calls == []
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -552,7 +567,7 @@ def observation(text: str, *, action_id: str = "a0", tool_name: str = "terminal"
         id=f"o-{action_id}",
         action_id=action_id,
         tool_name=tool_name,
-        observation=SimpleNamespace(model_dump_json=lambda: json.dumps({"content": text})),
+        observation=SimpleNamespace(model_dump=lambda: {"content": [{"text": text}]}),
     )
 
 
@@ -560,7 +575,7 @@ def action(text: str, *, event_id: str = "a0") -> Event:
     return Event(
         id=event_id,
         tool_name="terminal",
-        action=SimpleNamespace(model_dump_json=lambda: json.dumps({"command": text})),
+        action=SimpleNamespace(model_dump=lambda: {"command": text}),
         thought=[SimpleNamespace(text="")],
     )
 
@@ -622,6 +637,44 @@ def test_digests_are_left_alone_without_the_conversations_tool_output(case):
     provenance.check_text(f"`{CORRUPTED}` is the shipped digest", source="comment")
 
     assert lookup.calls == []
+
+
+def test_tokens_after_a_newline_a_tab_or_a_colour_code_are_indexed(case):
+    from openhands.tools.terminal import TerminalObservation
+
+    provenance, _, _ = case
+    second = "4a5b6c7d" * 8
+    printed = TerminalObservation.from_text(
+        text=f"{SHA256}  a.py\n{second}  b.py\n\t{BLOB}\n\x1b[33m{CORRUPTED[:16]}\x1b[0m\n",
+        command="sha256sum a.py b.py",
+        exit_code=0,
+    )
+    index = observed(Event(id="o-a0", action_id="a0", tool_name="terminal", observation=printed))
+
+    for text in (f"SHA-256 {second} of b.py", f"blob {BLOB}", f"digest {CORRUPTED[:16]}"):
+        provenance.check_text(text, source="comment", observed=index)
+
+
+def test_a_tool_error_quoting_the_agent_does_not_vouch_for_its_token(case):
+    provenance, _, _ = case
+    refusal = Event(
+        id="e1",
+        tool_name="post_assignment_comment",
+        tool_call_id="call-1",
+        error=(
+            "Error executing tool 'post_assignment_comment': digest "
+            f"'{CORRUPTED}' in the comment was not printed by any tool in this conversation."
+        ),
+    )
+    index = observed(
+        action(f"post digest {CORRUPTED}", event_id="a1"),
+        refusal,
+        observation(f"{SHA256}  submission.py", action_id="a2"),
+    )
+
+    with pytest.raises(ProvenanceError, match="^digest"):
+        provenance.check_text(f"digest {CORRUPTED}", source="comment", observed=index)
+    provenance.check_text(f"digest {SHA256}", source="comment", observed=index)
 
 
 def test_an_echo_of_the_agents_own_command_does_not_vouch_for_a_digest(case):
@@ -727,6 +780,24 @@ def test_counted_outcomes_are_not_the_runs_state(case, text):
 
     with pytest.raises(ProvenanceError, match="ab12cd34 is finished in W&B.*failed"):
         provenance.check_text("run ab12cd34 failed after 3 steps", source="comment")
+    # A number that opens a clause is not a count of the state word before it.
+    with pytest.raises(ProvenanceError, match="ab12cd34 is finished in W&B.*failed"):
+        provenance.check_text("run ab12cd34 failed: 3 of 5 seeds diverged", source="comment")
+
+
+def test_a_declared_non_zero_exit_leaves_the_wandb_state_to_wandb(case):
+    provenance, lookup, _ = case
+    write_record(provenance.training_dir, state=TrainingState.FINISHED, run_ids=("cd34ef56",))
+
+    provenance.check_text("run cd34ef56 finished", source="comment")
+    assert lookup.calls == []
+
+    write_record(
+        provenance.training_dir, state=TrainingState.FINISHED, run_ids=("cd34ef56",), exit_code=3
+    )
+    with pytest.raises(ProvenanceError, match="cd34ef56 is crashed in W&B.*finished"):
+        provenance.check_text("run cd34ef56 finished", source="comment")
+    assert lookup.calls == [("acme", "cfd", "cd34ef56")]
 
 
 def test_unlabelled_hex_tokens_must_match_a_source_when_tool_output_is_known(case):

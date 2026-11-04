@@ -650,12 +650,14 @@ run column, or after `run`, `W&B` or `wandb`) must be in the student's
 training records or in the run's W&B project. A commit (after `commit`,
 `SHA`, `HEAD` or a similar word) must resolve in the assignment worktree or,
 when the worktree has not fetched it, in the repository on GitHub, so a
-peer's PR head counts. A file digest (after `SHA-256`, `sha256sum`, `digest`,
-`checksum` or `file`, or any 64-hex token) must have been printed by a tool
+peer's PR head counts. A file digest (after `SHA-256`, `sha256sum`, `digest`
+or `checksum`, or any 64-hex token) must have been printed by a tool
 in the conversation, exactly or as a prefix of a printed digest; the `SHA` of
 `SHA-256` is not a commit word. A git object id (after `blob`, `hash-object`
 or `ls-tree`) must be in that tool output or an object of the worktree. A
-training id (after `training`) must be the prefix of one run record. A
+training id (after `training`) must be a prefix of a run record's id; a
+prefix shared by several records passes, and `training run <run-shaped id>`
+is checked as a W&B run. A
 run-shaped token within reach of `job`, `check`, `official`, `scored`,
 `submission` or `judge` belongs to a judge or job system and is not looked
 up. A hexadecimal token of seven or more characters with no label must have
@@ -663,12 +665,17 @@ been printed by a tool, start a run record or recorded run id, or resolve as
 a commit. The tool output of a conversation is every observation and every
 delivered message, minus the tokens of the action an observation answers, so
 an echoed command or edited file does not vouch for what the agent typed; a
-new conversation starts with an empty index. A state word in the same clause
+tool error quoting the agent's call does not count; a new conversation starts
+with an empty index; and the system prompt, including `program.md`, is not
+tool output. A state word in the same clause
 as a run id must match the run's state class (running, finished, or stopped);
 a counted outcome such as `0 failed` or `failed=0` is not a state. The record
 vouches for the state only of the last W&B run of a terminal process;
-otherwise W&B does. A run whose launch declared `expected_exit_codes` is
-recorded as finished when it exits with one of them. Bare numbers are never
+otherwise W&B does. A run supervised in the student pod whose launch
+declared `expected_exit_codes` (which must include 0) is recorded as finished
+when it exits with one of them, keeping its error tail; the record then does
+not vouch for the W&B run's state, W&B does. A remote launch refuses the
+field. Bare numbers are never
 SHAs. Every refusal names the class of the identifier and how to fix it. A
 failed W&B or GitHub lookup refuses the call as unchecked, so nothing
 unverified is published.

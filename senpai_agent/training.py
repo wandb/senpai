@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import BinaryIO, Literal
 
 import psutil
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from senpai_agent.worktree_snapshot import NAMED_PATHS, WorktreeSnapshot
 from senpai_agent.processes import signal_process_group, terminate_process_group
@@ -208,6 +208,14 @@ class TrainingSpec(BaseModel):
             "records the run as failed. Applies to runs supervised in this pod."
         ),
     )
+
+    @field_validator("expected_exit_codes")
+    @classmethod
+    def _designed_exit_codes(cls, codes: tuple[int, ...]) -> tuple[int, ...]:
+        # A clean exit is always a completed run, and a signal never is.
+        if 0 not in codes or any(not 0 <= code <= 255 for code in codes):
+            raise ValueError("expected_exit_codes must include 0 and lie within 0..255")
+        return codes
 
 
 class TrainingResult(BaseModel):
@@ -631,9 +639,11 @@ class TrainingSupervisor:
             elapsed_seconds=time.monotonic() - active.started,
             log_path=str(active.log_path),
             wandb_run_ids=tuple(run_ids),
+            # A run that finished with a declared non-zero code keeps the tail
+            # that says why, as a gate that exits 3 on a failed check does.
             error_tail=(
                 error_tail.decode(errors="ignore")
-                if state is not TrainingState.FINISHED
+                if state is not TrainingState.FINISHED or exit_code != 0
                 else ""
             ),
             last_log_line=_last_log_line(error_tail),

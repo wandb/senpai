@@ -112,11 +112,12 @@ _COMMIT_CONTEXT = re.compile(
     r"(?i)\bcommits?\b|\bshas?\b(?!-\d)|\bhead\b|\bbase\b|\bgit\b|\bcheckout\b"
     r"|\bmerged?\b|\bpush(?:ed)?\b|\brev-parse\b|@$"
 )
-# A file digest ("file SHA-256 `391730cf…`", "sha256sum", "checksum") is
-# checked against the digests tools printed in the conversation.
+# A file digest ("SHA-256 `391730cf…`", "sha256sum", "checksum") is checked
+# against the digests tools printed in the conversation. "file" is ordinary
+# prose around commits too, so only an algorithm word names a digest.
 _DIGEST_CONTEXT = re.compile(
     r"(?i)\bsha-?\d{1,3}\b|\b(?:sha\d*|md5|b2)sum\b|\bmd5\b|\bblake\d\w*\b"
-    r"|\bdigests?\b|\bchecksums?\b|\bfiles?\b"
+    r"|\bdigests?\b|\bchecksums?\b"
 )
 # A git object id ("blob 3917…", "git hash-object", an ls-tree row) is an
 # object of the worktree, or output of a git command, not a commit.
@@ -150,7 +151,9 @@ _STATE_WORDS = re.compile(
 # "12 passed, 0 failed" and "failed=0" count outcomes; they are not the state
 # of the run named in the same clause.
 _COUNT_BEFORE = re.compile(r"(?<![A-Za-z0-9_])\d+\s*$")
-_COUNT_AFTER = re.compile(r"\s*[:=]\s*\d")
+# "failed=0" is a count; "failed: 0" is one only when the number ends the
+# phrase, so "failed: 3 of 5 seeds diverged" still claims the state.
+_COUNT_AFTER = re.compile(r"\s*(?:=\s*\d|:\s*\d+\s*(?:[,;.)(]|$))")
 # A context word names the identifier only within a few words of it, in the
 # same clause; other identifiers in a list between them do not count.
 _CONTEXT_WORDS = 3
@@ -175,7 +178,7 @@ _NOT_A_COMMIT = (
     "Cite a commit from another repository by its URL. If {token!r} is not a "
     "commit, reword so it does not directly follow 'commit', 'SHA', 'HEAD' or "
     "a similar word: a file digest is recognised after 'SHA-256', 'sha256sum', "
-    "'digest', 'checksum' or 'file', and a git object id after 'blob', "
+    "'digest' or 'checksum', and a git object id after 'blob', "
     "'hash-object' or 'ls-tree'."
 )
 _NOT_A_DIGEST = (
@@ -206,7 +209,8 @@ class ObservedIdentifiers:
     command it answers or the text of an edited file, so the tokens of the
     action an observation answers are not counted for it. A token the agent
     typed becomes observed once a tool prints it on its own. Agent messages
-    and condensation summaries are model-written and never count.
+    and condensation summaries are model-written, and a tool error is the
+    harness quoting the agent's call, so none of them count.
     """
 
     def __init__(self, events: Sequence[object]):
@@ -245,27 +249,43 @@ class ObservedIdentifiers:
         return any(seen.startswith(token) for seen in self._tokens)
 
 
+_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+
+
 def _hex_tokens(text: str) -> frozenset[str]:
-    return frozenset(_HEX_TOKEN.findall(text))
+    return frozenset(_HEX_TOKEN.findall(_ANSI_ESCAPE.sub("", text)))
+
+
+def _text_of(value: object) -> str:
+    """Join the strings inside a model or its dump, one per line.
+
+    Scanning the strings themselves, not their JSON encoding, keeps a token
+    that follows a newline or a tab in tool output a token of its own.
+    """
+
+    if isinstance(value, str):
+        return value
+    if hasattr(value, "model_dump"):
+        return _text_of(value.model_dump())
+    if isinstance(value, dict):
+        return "\n".join(_text_of(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_text_of(item) for item in value)
+    return ""
 
 
 def _action_text(event: object) -> str:
-    action = getattr(event, "action", None)
-    parts = [action.model_dump_json() if hasattr(action, "model_dump_json") else ""]
+    parts = [_text_of(getattr(event, "action", None))]
     parts.extend(getattr(part, "text", "") for part in getattr(event, "thought", ()))
-    return " ".join(parts)
+    return "\n".join(parts)
 
 
 def _observed_text(event: object) -> str | None:
     observation = getattr(event, "observation", None)
     if observation is not None:
-        if hasattr(observation, "model_dump_json"):
-            return observation.model_dump_json()
-        return str(observation)
+        return _text_of(observation) if hasattr(observation, "model_dump") else str(observation)
     if hasattr(event, "rejection_reason"):
         return str(event.rejection_reason)
-    if hasattr(event, "error") and hasattr(event, "tool_name"):
-        return str(event.error)
     message = getattr(event, "llm_message", None)
     if message is not None and getattr(event, "source", None) != "agent":
         return " ".join(
@@ -599,9 +619,15 @@ class IdentifierProvenance:
             # of a process still running, may already have ended in W&B.
             if not quoted:
                 return
+            # A finished record with a declared non-zero exit code says only
+            # that the process exited as designed; W&B still owns its run's state.
+            declared_exit = (
+                record.state is TrainingState.FINISHED and record.exit_code not in (None, 0)
+            )
             if (
                 record.state is not TrainingState.RUNNING
                 and record.wandb_run_ids[-1:] == (run_id,)
+                and not declared_exit
             ):
                 _require_state(
                     f"W&B run {run_id} (training {record.training_id})",

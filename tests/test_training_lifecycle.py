@@ -94,7 +94,9 @@ def test_a_declared_exit_code_completes_the_run(tmp_path: Path, expected, code, 
     assert (terminal.state, terminal.exit_code, terminal.expected_exit_codes) == (
         state, code, expected,
     )
-    assert (terminal.error_tail == "") is (state is TrainingState.FINISHED)
+    # A declared non-zero exit keeps the tail that says why the gate exited.
+    assert (terminal.error_tail == "") is (code == 0)
+    assert ("gate" in terminal.error_tail) is (code != 0)
     reopened = TrainingSupervisor(workspace=workspace, state_dir=tmp_path / "state")
     assert reopened.get_training_status(running.training_id).expected_exit_codes == expected
 

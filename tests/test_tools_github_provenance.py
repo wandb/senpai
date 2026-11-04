@@ -1,6 +1,5 @@
 """Student GitHub tools refuse identifiers that no runtime record accounts for."""
 
-import json
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
@@ -162,7 +161,7 @@ def test_post_assignment_comment_checks_digests_against_the_conversations_tool_o
                     action_id="a1",
                     tool_name="terminal",
                     observation=SimpleNamespace(
-                        model_dump_json=lambda: json.dumps({"content": f"{digest}  submission.py"})
+                        model_dump=lambda: {"content": f"{digest}  submission.py"}
                     ),
                 )
             ]
