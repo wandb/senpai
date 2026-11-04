@@ -674,6 +674,11 @@ history and dirty work are preserved and reported once; an unchanged assignment
 reminder does not repeatedly wake the model, while changed refs, local work, or
 new feedback still do.
 
+A tool call whose arguments fail validation is answered with the failing field,
+the schema at that field, the tool's required fields and one valid example
+payload, for Senpai's tools and for the OpenHands terminal and file editor
+alike, so the next call can be corrected without guessing.
+
 `get_prs` returns complete PR bodies and discussions. Up to five PRs are returned in context by default; larger selections become a Markdown artifact outside the target checkout so long histories do not pollute the main conversation.
 
 `get_pr_source` lets advisors and students inspect private PR code using the
