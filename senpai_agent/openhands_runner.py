@@ -1706,8 +1706,30 @@ def final_agent_result(
         if isinstance(event, ActionEvent):
             message = getattr(event.action, "message", None)
             if isinstance(message, str) and message.strip():
-                return message.strip()
+                return _final_action_report(event, message)
     raise RuntimeError("child finished without a model-visible result")
+
+
+def _final_action_report(event: ActionEvent, message: str) -> str:
+    """Join the text written with the final action to that action's message.
+
+    A child often writes its report as the text before its finish call and
+    sends a one-line finish message such as "Report delivered above". Only
+    the message used to reach the parent, so the report was lost. A header
+    separates the two texts when both are returned.
+    """
+
+    message = message.strip()
+    thought = "\n".join(
+        content.text.strip()
+        for content in event.thought
+        if isinstance(content, TextContent) and content.text.strip()
+    ).strip()
+    if not thought or thought in message:
+        return message
+    if message in thought:
+        return thought
+    return f"{thought}\n\n## Finish message\n\n{message}"
 
 
 def _result_token_count(llm: LLM, result: str) -> int:

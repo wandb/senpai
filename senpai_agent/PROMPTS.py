@@ -60,13 +60,13 @@ DELEGATED_SEARCH_MODE_PROMPT = """Search mode: {{SEARCH_MODE}}
 
 DELEGATED_TASK_PROMPT = """# Delegated task
 
-You are a fresh Senpai subagent. Perform only the assigned task and return a concise, evidence-linked report to the parent.
+You are a fresh Senpai subagent. Perform only the assigned task and return a concise, evidence-linked report to the parent. The parent receives only your final `finish` call: the text you write with it and its message. Put the complete report there; nothing you wrote earlier reaches the parent.
 
 {{ASSIGNMENT}}"""
 
 DELEGATED_TASK_WITH_CONTEXT_PROMPT = """# Delegated task with parent context
 
-The JSON below is the complete model-visible parent context at delegation time. Use it as evidence, perform only the assigned task, and return a concise, evidence-linked report.
+The JSON below is the complete model-visible parent context at delegation time. Use it as evidence, perform only the assigned task, and return a concise, evidence-linked report. The parent receives only your final `finish` call: the text you write with it and its message. Put the complete report there; nothing you wrote earlier reaches the parent.
 
 <parent_context_json>
 {{PARENT_CONTEXT_JSON}}
@@ -192,6 +192,7 @@ Your conversation context was compacted at {{COMPACTED_AT}} ({{TRIGGER}}). The r
 CONTEXT_COMPACTED_WITHOUT_STATE_PROMPT = """## Context compacted
 
 Your conversation context was compacted at {{COMPACTED_AT}} ({{TRIGGER}}). No research state has been saved yet, so only the compaction summary carries what you knew. Save one now with `update_research_state`: current best with identifiers, lanes in flight, bars, budget, operator rules, open questions and recent decisions. The harness re-sends it verbatim after every compaction."""
+DELIVERY_TIME_PROMPT = """Delivered at (UTC): {{CURRENT_TIME}}"""
 
 STUDENT_AVAILABLE_FOR_ASSIGNMENT_PROMPT = """## Student available for assignment: `{{STUDENT}}`
 

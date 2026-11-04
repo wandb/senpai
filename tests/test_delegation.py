@@ -119,6 +119,7 @@ def test_child_prompt_contains_complete_snapshot_and_task():
     prompt = render_child_prompt(request, "Review the result and report next steps.")
 
     assert "Review the result and report next steps." in prompt
+    assert "Put the complete report there" in prompt
     assert "Inspect PR #17." in prompt
     assert "Progressively disclosed skill body." in prompt
     assert "I will compare the evidence." in prompt

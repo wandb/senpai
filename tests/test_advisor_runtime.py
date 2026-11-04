@@ -18,7 +18,11 @@ from senpai_agent.advisor import (
 )
 from senpai_agent.delegation import AgentStatusAction, AgentStatusObservation
 from senpai_agent.hooks import queued_feedback_marker
-from senpai_agent.inbox import PersistentInbox, deliver_turn_messages
+from senpai_agent.inbox import (
+    PersistentInbox,
+    deliver_turn_messages,
+    strip_delivery_stamp,
+)
 from senpai_agent.local_events import LocalEvent, LocalEventStore
 from senpai_agent.mailbox import ControllerEvent
 
@@ -98,7 +102,8 @@ class SteeringConversation:
         self.pauses = 0
 
     def send_message(self, message: str, sender: str | None = None) -> None:
-        self.messages.append(message)
+        # The branch keeps the stamped delivery; assertions compare the event.
+        self.messages.append(strip_delivery_stamp(message))
         self.state.append(SimpleNamespace(message=message, sender=sender))
 
     def interrupt(self) -> None:

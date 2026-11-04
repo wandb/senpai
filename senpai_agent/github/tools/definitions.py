@@ -220,7 +220,11 @@ class SendAssignmentFeedbackTool(
         return _tool(
             cls, SendAssignmentFeedbackAction, "Send assignment feedback",
             "Send a clarification, hold, question, or nudge to the current assignment "
-            "without changing its revision or routing state.",
+            "without changing its revision or routing state. If the PR head moved "
+            "since you read it, the guidance is posted against the live head and "
+            "the observation reports stale_head_sha. A PR already in status:review "
+            "takes request_assignment_revision, merge_experiment, or "
+            "close_experiment instead.",
             SendAssignmentFeedbackExecutor(runtime.workflow),
         )
 

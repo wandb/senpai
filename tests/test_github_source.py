@@ -109,7 +109,7 @@ def test_private_merged_pr_source_is_pinned_and_available_to_reviewers(source_to
 
 
 @pytest.mark.parametrize("field", ["head", "base"])
-def test_source_refuses_moved_pr_before_returning_an_artifact(source_tool, field):
+def test_source_refuses_a_pr_that_moves_during_the_read(source_tool, field):
     tool, responses, calls, tmp_path = source_tool
     details = responses["/repos/acme/private/pulls/7"]
     def moved():
@@ -118,9 +118,39 @@ def test_source_refuses_moved_pr_before_returning_an_artifact(source_tool, field
             value[field]["sha"] = "c" * 40
         return value
     responses["/repos/acme/private/pulls/7"] = moved
-    with pytest.raises(GitHubReadError, match="changed"):
+    with pytest.raises(GitHubReadError, match="changed during the read"):
         read(tool, paths=("src/evaluate.py",))
     assert not list((tmp_path / "state").glob("*.md"))
+
+
+def test_source_follows_a_head_that_moved_since_get_prs(source_tool):
+    """get_pr_source failed 11 times on "PR base or head changed" in one campaign;
+    each retry with the refreshed head then read the same files."""
+
+    tool, responses, calls, tmp_path = source_tool
+    new_head = "e" * 40
+    responses["/repos/acme/private/pulls/7"]["head"]["sha"] = new_head
+    responses[f"/repos/acme/private/compare/{BASE}...{new_head}?per_page=1"] = responses.pop(
+        f"/repos/acme/private/compare/{BASE}...{HEAD}?per_page=1"
+    )
+
+    result = read(tool, paths=("src/evaluate.py",))
+
+    assert result.revision_moved is True
+    assert (result.requested_base_sha, result.requested_head_sha) == (BASE, HEAD)
+    assert (result.base_sha, result.head_sha) == (BASE, new_head)
+    text = Path(result.path).read_text()
+    assert f"Head: `{new_head}`" in text and HEAD not in text
+    assert TEXT.decode() in text
+    assert f"/repos/acme/private/compare/{BASE}...{new_head}?per_page=1" in calls
+    unmoved = read(tool, paths=("src/evaluate.py",))
+    assert unmoved.revision_moved is True
+
+    responses["/repos/acme/private/pulls/7"]["head"]["sha"] = HEAD
+    responses[f"/repos/acme/private/compare/{BASE}...{HEAD}?per_page=1"] = responses[
+        f"/repos/acme/private/compare/{BASE}...{new_head}?per_page=1"
+    ]
+    assert read(tool).revision_moved is False
 
 
 @pytest.mark.parametrize("path", ["../secret", "/etc/passwd", "https://elsewhere/x", "src/../secret", "src\\secret"])
