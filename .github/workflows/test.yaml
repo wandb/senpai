@@ -6,6 +6,12 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# A new push to a pull request supersedes its running checks. Pushes to
+# branches and manual runs each get their own group and never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -16,6 +22,7 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
+        shard: [1, 2]
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -33,6 +40,7 @@ jobs:
           uv venv --python "${{ matrix.python-version }}"
           uv pip install --python .venv/bin/python \
             pytest \
+            pytest-xdist \
             psutil \
             python-dotenv \
             simple-parsing \
@@ -45,4 +53,10 @@ jobs:
             "openhands-tools @ git+https://github.com/morganmcg1/software-agent-sdk.git@e899135f98444f7bfe08441311a6f5e565d97b39#subdirectory=openhands-tools"
 
       - name: Test the complete control plane (no cluster)
-        run: .venv/bin/python -m pytest
+        run: |
+          # Test files split by name into two halves of about equal running time.
+          case "${{ matrix.shard }}" in
+            1) files='tests/test_[a-k]*.py' ;;
+            2) files='tests --ignore-glob=tests/test_[a-k]*.py' ;;
+          esac
+          .venv/bin/python -m pytest -n logical --durations=15 $files

@@ -6,6 +6,12 @@ on:
   pull_request: {}
   workflow_dispatch:
 
+# A new push to a pull request supersedes its running checks. Pushes to
+# branches and manual runs each get their own group and never cancel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 env:
   REGISTRY: ghcr.io
   SOURCE_REVISION: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -22,22 +28,31 @@ jobs:
     permissions:
       contents: read
       packages: write
+      pull-requests: read
 
     steps:
-      - name: Free disk space
+      - name: Decide whether this run needs the image
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ROLE: ${{ matrix.role }}
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_FILES: repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files
+          IMAGE_INPUTS: '^(Dockerfile\.student$|pyproject\.toml$|uv\.lock$|scripts/|\.github/workflows/build\.yaml$)'
         run: |
-          df -h /
-          sudo rm -rf /usr/lib/jvm
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune -af
-          df -h /
+          # The student image differs from the advisor image by its CUDA base and
+          # training stack, and pulling that base takes longer than every other
+          # check. A pull request that leaves the student's own inputs alone is
+          # validated by the advisor build and skips the student build.
+          build=true
+          if [ "$EVENT_NAME" = pull_request ] && [ "$ROLE" = student ]; then
+            changed=$(gh api --paginate "$PULL_REQUEST_FILES" --jq '.[].filename')
+            grep -qE "$IMAGE_INPUTS" <<< "$changed" || build=false
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
+        if: steps.image.outputs.build == 'true'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.SOURCE_REVISION }}
@@ -51,6 +66,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata
+        if: steps.image.outputs.build == 'true'
         id: meta
         uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
         with:
@@ -62,13 +78,19 @@ jobs:
             org.opencontainers.image.revision=${{ env.SOURCE_REVISION }}
 
       - name: Build and push
+        if: steps.image.outputs.build == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile.${{ matrix.role }}
           push: ${{ github.event_name != 'pull_request' }}
+          # A pull request's image is never used, so it stays in the build cache.
+          outputs: ${{ github.event_name == 'pull_request' && 'type=cacheonly' || '' }}
           pull: true
-          no-cache: true
+          # The published image carries its layer cache, so a pull request that
+          # leaves the lock alone reuses the dependency and browser layers.
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=inline' || '' }}
           build-args: |
             SENPAI_SOURCE_REVISION=${{ env.SOURCE_REVISION }}
           tags: ${{ steps.meta.outputs.tags }}
@@ -84,34 +106,41 @@ jobs:
       CHECK_TARGET_PYTHON: /usr/local/bin/python3
     permissions:
       contents: read
+      pull-requests: read
 
     steps:
-      - name: Free disk space
+      - name: Decide whether this run needs the image
+        id: image
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PULL_REQUEST_FILES: repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files
+          IMAGE_INPUTS: '^(Dockerfile\.student-on-base$|pyproject\.toml$|uv\.lock$|scripts/|\.github/workflows/build\.yaml$)'
         run: |
-          df -h /
-          sudo rm -rf /usr/lib/jvm
-          sudo rm -rf /usr/local/.ghcup
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/local/share/powershell
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/share/swift
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
-          sudo docker image prune -af
-          df -h /
+          # This image copies the same code as the advisor image, so a pull
+          # request that leaves its own inputs alone is covered by that build.
+          build=true
+          if [ "$EVENT_NAME" = pull_request ]; then
+            changed=$(gh api --paginate "$PULL_REQUEST_FILES" --jq '.[].filename')
+            grep -qE "$IMAGE_INPUTS" <<< "$changed" || build=false
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
 
       - name: Checkout
+        if: steps.image.outputs.build == 'true'
         uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           ref: ${{ env.SOURCE_REVISION }}
 
       - name: Build without publishing
+        if: steps.image.outputs.build == 'true'
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
         with:
           context: .
           file: Dockerfile.student-on-base
           push: false
+          outputs: type=cacheonly
           pull: true
-          no-cache: true
           build-args: |
             BASE_IMAGE=${{ env.CHECK_BASE_IMAGE }}
             TARGET_PYTHON=${{ env.CHECK_TARGET_PYTHON }}
