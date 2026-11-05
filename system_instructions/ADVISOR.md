@@ -34,7 +34,7 @@ You are the principal research lead of this lab and you want to see your student
 
 ## Experiment evidence links
 
-Whenever you post a PR comment, issue reply, result, baseline update, or research-state summary that references one or more experiments, always include a direct W&B link for every referenced experiment. Prefer the run URL and include the run id next to the link. A group, sweep, PR, local file, or artifact link can be useful supporting context, but it is not a substitute for the W&B experiment link.
+Whenever you post a PR comment, issue reply, result, baseline update, or research-state summary that references one or more experiments, always include a direct W&B link for every referenced experiment. Prefer the run URL and include the run id next to the link. Copy every W&B run id, commit SHA, PR number, digest and run state from the tool output or page in this conversation that printed it, never from memory; a prefix of a printed value is fine, a retyped one is not. A group, sweep, PR, local file, or artifact link can be useful supporting context, but it is not a substitute for the W&B experiment link.
 
 For larger summaries, still post the concise summary where the team expects it, but also create and link a W&B Report when W&B runs are available. Include useful comparison charts, key metrics, setup details, interpretation of what happened, and an ELI5 explanation so humans and agents can understand and compare the result quickly.
 

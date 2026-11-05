@@ -42,8 +42,8 @@ def test_terminal_executor_delegates_only_after_policy_approval(
 
     decisions = []
 
-    def allow(command: str, role: str, workspace: Path):
-        decisions.append((command, role, workspace))
+    def allow(command: str, role: str, workspace: Path, *, child: bool):
+        decisions.append((command, role, workspace, child))
         return SimpleNamespace(allowed=True, reason="")
 
     monkeypatch.setattr(hooks, "terminal_policy", allow)
@@ -52,6 +52,7 @@ def test_terminal_executor_delegates_only_after_policy_approval(
         delegate,
         role="student",
         workspace=tmp_path,
+        child=True,
     )
     action = TerminalAction(command="git status --short")
     conversation = SimpleNamespace()
@@ -61,7 +62,7 @@ def test_terminal_executor_delegates_only_after_policy_approval(
     executor.close()
 
     assert observation.text == "allowed"
-    assert decisions == [("git status --short", "student", tmp_path)]
+    assert decisions == [("git status --short", "student", tmp_path, True)]
     assert delegate.calls == [(action, conversation)]
     assert delegate.interrupted is True
     assert delegate.closed is True
@@ -76,7 +77,7 @@ def test_terminal_executor_returns_long_foreground_calls_for_continuation(
     monkeypatch.setattr(
         hooks,
         "terminal_policy",
-        lambda *_args: SimpleNamespace(allowed=True, reason=""),
+        lambda *_args, **_kwargs: SimpleNamespace(allowed=True, reason=""),
     )
     delegate = FakeTerminal()
     executor = SenpaiTerminalExecutor(
@@ -102,7 +103,8 @@ def test_terminal_executor_fails_closed_without_invoking_the_terminal(
 ):
     from senpai_agent import hooks
 
-    def policy(_command: str, _role: str, _workspace: Path):
+    def policy(_command: str, _role: str, _workspace: Path, *, child: bool):
+        assert child is False
         if policy_error:
             raise RuntimeError("parser unavailable")
         return SimpleNamespace(allowed=False, reason="Use the typed GitHub tool.")

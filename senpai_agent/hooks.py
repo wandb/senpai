@@ -5,12 +5,13 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from senpai_agent.git_transport import GitWorkflowPreconditionError
+from senpai_agent.git_transport import GIT_EXECUTABLE, GitWorkflowPreconditionError
 from senpai_agent.secrets import SHELL_STARTUP_ENV_NAMES
 from senpai_agent.training import training_result_paths
 from senpai_agent.worktree_snapshot import require_tracked_changes_committed
@@ -141,6 +142,22 @@ _GIT_FETCH_REASON = (
     "a branch read-only into refs/remotes/origin/<branch>, then inspect it with "
     "git log, diff or show; sync_advisor_branch refreshes the advisor's own branch."
 )
+_GIT_ORIGIN_REASON = (
+    "This shell has no GitHub credential for origin, the assignment repository. "
+    "Call fetch_branch(branch=...) to fetch one of its branches read-only into "
+    "refs/remotes/origin/<branch>, then inspect it with git log, diff or show; "
+    "other repositories can still be cloned or listed by URL."
+)
+# `git clone` and `git ls-remote` options that take a separate value before
+# the repository.
+_GIT_CLONE_VALUE_OPTIONS = {
+    "--branch", "--bundle-uri", "--config", "--depth", "--filter", "--jobs",
+    "--origin", "--ref-format", "--reference", "--reference-if-able",
+    "--separate-git-dir", "--server-option", "--shallow-exclude",
+    "--shallow-since", "--template", "--upload-pack", "-b", "-c", "-j", "-o",
+    "-u",
+}
+_GIT_LS_REMOTE_VALUE_OPTIONS = {"--server-option", "--sort", "--upload-pack", "-o"}
 _POLLING_REASON = (
     "Do not sleep or poll in the terminal. Finish the turn: Senpai resumes this "
     "conversation as soon as a supervised run ends or, for a run in this pod, its "
@@ -152,7 +169,8 @@ _LOG_STREAM_REASON = (
     "wait for the run with get_training_status(training_id, wait_seconds) or by "
     "finishing the turn; Senpai resumes this conversation when the run ends."
 )
-# Only students hold the training tools; every other agent waits on agents.
+# Only a main student holds the training tools; the advisor and every child
+# subagent wait on agents.
 _POLLING_REASON_WITHOUT_TRAINING = (
     "Do not sleep or poll in the terminal. Finish the turn: Senpai resumes this "
     "conversation when the event you are waiting for arrives. To wait for child "
@@ -1208,7 +1226,7 @@ def _find_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
     return PolicyDecision(True)
 
 
-def _git_policy(arguments: list[str]) -> PolicyDecision:
+def _git_policy(arguments: list[str], workspace: Path) -> PolicyDecision:
     command_line = _wrapper_command(
         arguments,
         value_options={
@@ -1242,7 +1260,21 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
             return PolicyDecision(True)
     elif command in {"fetch", "pull"}:
         return PolicyDecision(False, _GIT_FETCH_REASON)
-    elif command in _GIT_TERMINAL_COMMANDS:
+    elif command == "ls-remote":
+        # With no repository, ls-remote reads origin.
+        positional = _wrapper_command(options, value_options=_GIT_LS_REMOTE_VALUE_OPTIONS)
+        if not positional or _is_origin(positional[0], workspace):
+            return PolicyDecision(False, _GIT_ORIGIN_REASON)
+    elif command == "clone":
+        positional = _wrapper_command(options, value_options=_GIT_CLONE_VALUE_OPTIONS)
+        if positional and _is_origin(positional[0], workspace):
+            return PolicyDecision(False, _GIT_ORIGIN_REASON)
+    elif command == "submodule":
+        # `update --remote` fetches every submodule's origin.
+        subcommand = _wrapper_command(options)
+        if subcommand[:1] == ["update"] and "--remote" in subcommand:
+            return PolicyDecision(False, _GIT_ORIGIN_REASON)
+    if command in _GIT_TERMINAL_COMMANDS:
         return PolicyDecision(True)
     return PolicyDecision(
         False,
@@ -1250,6 +1282,34 @@ def _git_policy(arguments: list[str]) -> PolicyDecision:
         "read-only Git commands, and use the typed Senpai tool for branch "
         "publication.",
     )
+
+
+def _is_origin(repository: str, workspace: Path) -> bool:
+    """Tell whether a clone or ls-remote target is the checkout's origin."""
+    if repository == "origin":
+        return True
+    origin = subprocess.run(
+        [GIT_EXECUTABLE, "-C", str(workspace), "config", "--get", "remote.origin.url"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout.strip()
+    return bool(origin) and _remote_key(repository) == _remote_key(origin)
+
+
+def _remote_key(url: str) -> str:
+    """Identify a remote by host and path: scheme, user, case and .git do not count."""
+    key = url.strip().casefold()
+    if "://" in key:
+        key = key.split("://", 1)[1]
+    else:
+        host, separator, path = key.partition(":")
+        if separator and "/" not in host:
+            # scp-like [user@]host:path
+            key = f"{host}/{path}"
+    host, slash, path = key.partition("/")
+    key = f"{host.rsplit('@', 1)[-1]}{slash}{path}".rstrip("/")
+    return key.removesuffix(".git").rstrip("/")
 
 
 def _shell_program(program: str, workspace: Path) -> str | None:
@@ -1386,7 +1446,7 @@ def _segment_policy(tokens: list[str], workspace: Path) -> PolicyDecision:
         return PolicyDecision(False, "Do not evaluate dynamic variable names.")
 
     if program == "git":
-        return _git_policy(arguments)
+        return _git_policy(arguments, workspace)
     if program == "gh":
         return _gh_policy(tokens, index)
     if program == "curl":
@@ -1432,9 +1492,12 @@ def terminal_policy(
     command: str,
     role: str,
     workspace: Path,
+    *,
+    child: bool = False,
 ) -> PolicyDecision:
+    """Decide a terminal command; `child` marks a subagent, which has no training tools."""
     decision = _terminal_decision(command, workspace)
-    if decision.allowed or role == "student":
+    if decision.allowed or (role == "student" and not child):
         return decision
     if decision.reason == _POLLING_REASON:
         return PolicyDecision(False, _POLLING_REASON_WITHOUT_TRAINING)
@@ -1523,7 +1586,13 @@ def hook_main(
         role = env.get("SENPAI_ROLE", "")
         if command == "pre-tool-use":
             tool_input = event.get("tool_input") or {}
-            return _emit(terminal_policy(str(tool_input["command"]), role, working_dir))
+            # Every child subagent process carries its delegation task id.
+            child = bool(env.get("SENPAI_DELEGATION_TASK_ID"))
+            return _emit(
+                terminal_policy(
+                    str(tool_input["command"]), role, working_dir, child=child
+                )
+            )
         if command == "stop":
             state_dir_value = env.get("SENPAI_OPENHANDS_STATE_DIR")
             state_dir = Path(state_dir_value).resolve() if state_dir_value else None

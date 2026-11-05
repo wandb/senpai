@@ -685,7 +685,9 @@ alike, so the next call can be corrected without guessing.
 repository, such as a PR's head branch or the advisor branch, into
 `refs/remotes/origin/<branch>` of its checkout without changing the checkout. The
 agent shells hold no GitHub credential, so `git fetch` and `git pull` are denied
-there with a pointer to this tool; the fetch runs with the controller's token in a disposable repository and
+there with a pointer to this tool, as are `git ls-remote`, `git clone` and
+`git submodule update --remote` when they target `origin` (other repositories
+stay reachable by URL); the fetch runs with the controller's token in a disposable repository and
 the checkout receives the objects over a local file fetch, as `sync_advisor_branch`
 does for the advisor.
 

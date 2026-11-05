@@ -171,6 +171,19 @@ def test_student_charter_requires_pasted_identifiers_and_labelled_derived_number
     assert "precision the tool printed and no more" in report
 
 
+def test_advisor_charter_requires_pasted_identifiers_where_runs_are_cited():
+    instructions = (ROOT / "system_instructions" / "ADVISOR.md").read_text()
+    assert "## Experiment evidence links" in instructions and "## Priorities" in instructions
+    evidence = instructions.split("## Experiment evidence links", 1)[1].split("## Priorities", 1)[0]
+
+    # The student's copy rule, stated once, beside the run-link rule it extends.
+    assert instructions.count("never from memory") == 1
+    assert "Copy every W&B run id, commit SHA, PR number, digest and run state" in evidence
+    assert "never from memory" in evidence
+    assert "a prefix of a printed value is fine, a retyped one is not" in evidence
+    assert "include the run id next to the link" in evidence
+
+
 def test_student_charter_requires_typed_workflow_and_training_tools():
     instructions = (ROOT / "system_instructions" / "STUDENT.md").read_text()
     submission_skill = (

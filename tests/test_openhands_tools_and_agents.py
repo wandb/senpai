@@ -24,6 +24,7 @@ from senpai_agent.openhands_runner import (
     find_named_agent,
     resolve_plugin_dir,
     sanitized_agent_definitions,
+    senpai_terminal_tools,
 )
 from senpai_agent.tools import (
     LoadBrowserAction,
@@ -53,8 +54,18 @@ def test_runtime_agent_keeps_the_persisted_delegate_tool_compatible():
 
 def test_child_mode_keeps_bounded_delegation_lifecycle_tools(tmp_path):
     config = runtime_config(tmp_path, child=True)
-    names = {tool.name for tool in build_main_tools(config)}
+    by_name = {tool.name: tool for tool in build_main_tools(config)}
+    names = set(by_name)
 
+    # The terminal policy learns the child has no training tools; a main
+    # agent's persisted spec keeps only the role.
+    assert by_name["senpai_terminal"].params == {"role": config.role, "child": True}
+    assert senpai_terminal_tools([Tool(name="terminal")], "student") == [
+        Tool(name="senpai_terminal", params={"role": "student"})
+    ]
+    assert senpai_terminal_tools([Tool(name="terminal")], "student", child=True) == [
+        Tool(name="senpai_terminal", params={"role": "student", "child": True})
+    ]
     assert "task_tool_set" not in names
     assert {
         "spawn_agents",
