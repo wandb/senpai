@@ -207,6 +207,40 @@ LiteLLM's approximate token count has room to err, for example 160000 on a
 196,608-token input limit; the launcher warns when it is not below a
 `custom_openai/` endpoint's limit.
 
+The advisor and students can compact at different sizes.
+`advisor_compaction_trigger_tokens` and `student_compaction_trigger_tokens`, and
+the matching `advisor_compaction_trigger_events` and
+`student_compaction_trigger_events`, set that role's own conversation. A role
+without its own value uses `compaction_trigger_tokens` or
+`compaction_trigger_events`. Agents on the smart, fast, and frontier profiles
+always use the shared values, whichever role starts them: delegated children,
+the merge supervisor, and its code reviewer, which also sizes its embedded diff
+and discussion from that token trigger. Those profiles run the same models in
+every pod, so a trigger sized for the advisor's window never reaches a smaller
+helper model. The launcher applies the minimums to each role's values. It warns
+about a `custom_openai/` input limit only for the settings that `custom_openai/`
+profiles use. This example runs the advisor on GPT-6 Astra next to DeepSeek
+students and helpers:
+
+```yaml
+advisor_model: openai/gpt-6-astra
+frontier_model: openai/gpt-6-astra
+student_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+student_reasoning_effort: xhigh
+smart_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+smart_reasoning_effort: xhigh
+fast_model: custom_openai/deepseek-ai/DeepSeek-V4.1-Flash-1017
+fast_reasoning_effort: low
+custom_openai_base_url: https://inference.example.ts.net/v1
+custom_openai_context_tokens: 262144     # 196,608-token input limit with the default output budget
+compaction_trigger_tokens: 160000        # students and every child agent
+advisor_compaction_trigger_tokens: 600000
+```
+
+The advisor compacts natively at 600,000 tokens of its 1,050,000-token window.
+Students and every child agent compact at 160,000, including the advisor's
+frontier children on Astra.
+
 If using W&B Inference use `wandb/` provider as the provider. For example `wandb/zai-org/GLM-5.2`, SENPAI
 uses `WANDB_API_KEY` for auth.
 

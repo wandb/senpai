@@ -186,9 +186,10 @@ def review_code_quality(
             )
             return results[0] if status == 0 and results else None
 
-        # The compaction trigger bounds the model's usable window in tokens; a
-        # matching character budget keeps the embedded context to about a third.
-        context_chars = config.compaction_trigger_tokens
+        # The reviewer's compaction trigger bounds its smart-profile model's
+        # usable window in tokens; a matching character budget keeps the
+        # embedded context to about a third.
+        context_chars = reviewer.compaction_trigger_tokens
         first_deadline = (
             started_at + (review_deadline - started_at) * FULL_REVIEW_TIME_SHARE
         )

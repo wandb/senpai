@@ -53,6 +53,7 @@ from senpai_agent.compaction import (
     DEFAULT_COMPACTION_TRIGGER_EVENTS,
     DEFAULT_COMPACTION_TRIGGER_TOKENS,
     MIN_COMPACTION_TRIGGER_EVENTS,
+    MIN_COMPACTION_TRIGGER_TOKENS,
 )
 from senpai_agent.custom_openai import (
     DEFAULT_MAX_OUTPUT_TOKENS as DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS,
@@ -187,8 +188,12 @@ class Args:
     fast_reasoning_effort: str = "medium"
     frontier_model: str = "anthropic/claude-opus-5-5"
     frontier_reasoning_effort: str = "max"
-    compaction_trigger_tokens: int = DEFAULT_COMPACTION_TRIGGER_TOKENS  # input tokens that start provider-native or OpenHands compaction
-    compaction_trigger_events: int = DEFAULT_COMPACTION_TRIGGER_EVENTS  # model-visible events that start OpenHands compaction
+    compaction_trigger_tokens: int = DEFAULT_COMPACTION_TRIGGER_TOKENS  # input tokens that start provider-native or OpenHands compaction; child agents always use it
+    compaction_trigger_events: int = DEFAULT_COMPACTION_TRIGGER_EVENTS  # model-visible events that start OpenHands compaction; child agents always use it
+    advisor_compaction_trigger_tokens: int | None = None  # the advisor's own conversation; unset uses compaction_trigger_tokens
+    advisor_compaction_trigger_events: int | None = None  # the advisor's own conversation; unset uses compaction_trigger_events
+    student_compaction_trigger_tokens: int | None = None  # each student's own conversation; unset uses compaction_trigger_tokens
+    student_compaction_trigger_events: int | None = None  # each student's own conversation; unset uses compaction_trigger_events
     custom_openai_base_url: str = ""  # OpenAI-compatible chat-completions base URL for custom_openai/ models
     custom_openai_context_tokens: int = 0  # server window shared by input and output, e.g. vLLM --max-model-len
     custom_openai_max_output_tokens: int = DEFAULT_CUSTOM_OPENAI_MAX_OUTPUT_TOKENS  # per-request output budget, including reasoning
@@ -291,6 +296,23 @@ def deployed_model_profiles(args: Args) -> dict[str, tuple[str, str]]:
     return profiles
 
 
+def compaction_trigger(
+    args: Args, profile: str, unit: Literal["tokens", "events"]
+) -> tuple[str, int]:
+    """The launch setting behind one model profile's compaction trigger, and its value.
+
+    The advisor and student conversations use their own setting when it is set.
+    Conversations on the shared profiles, and a role without its own setting,
+    use the shared one.
+    """
+    if profile in ("advisor", "student"):
+        setting = f"{profile}_compaction_trigger_{unit}"
+        if (value := getattr(args, setting)) is not None:
+            return setting, value
+    setting = f"compaction_trigger_{unit}"
+    return setting, getattr(args, setting)
+
+
 def custom_openai_served_model(args: Args) -> str | None:
     return served_model(model for model, _effort in deployed_model_profiles(args).values())
 
@@ -315,12 +337,19 @@ def validate_custom_openai_endpoint(args: Args) -> None:
         )
     except ValueError as error:
         sys.exit(f"ERROR: {error}")
-    if args.compaction_trigger_tokens >= endpoint.max_input_tokens:
+    triggers = dict(
+        compaction_trigger(args, name, "tokens")
+        for name, (model, _effort) in deployed_model_profiles(args).items()
+        if model_provider(model) == "custom_openai"
+    )
+    for setting, tokens in triggers.items():
+        if tokens < endpoint.max_input_tokens:
+            continue
         # The OpenHands condenser caps its token trigger at the model's input
         # limit, so a trigger at or above it compacts only once the counted
         # input already fills the server's window.
         print(
-            f"WARNING: --compaction_trigger_tokens {args.compaction_trigger_tokens} "
+            f"WARNING: --{setting} {tokens} "
             "is not below the custom_openai input limit of "
             f"{endpoint.max_input_tokens} tokens (custom_openai_context_tokens minus "
             "custom_openai_max_output_tokens); the condenser compacts only when the "
@@ -331,14 +360,14 @@ def validate_custom_openai_endpoint(args: Args) -> None:
 
 
 def validate_model_config(args: Args) -> None:
-    if args.compaction_trigger_tokens < 50_000:
-        sys.exit("ERROR: --compaction_trigger_tokens must be at least 50000")
-    if args.compaction_trigger_events < MIN_COMPACTION_TRIGGER_EVENTS:
-        sys.exit(
-            "ERROR: --compaction_trigger_events must be at least "
-            f"{MIN_COMPACTION_TRIGGER_EVENTS}"
-        )
     for name, (model, effort) in deployed_model_profiles(args).items():
+        for unit, minimum in (
+            ("tokens", MIN_COMPACTION_TRIGGER_TOKENS),
+            ("events", MIN_COMPACTION_TRIGGER_EVENTS),
+        ):
+            setting, value = compaction_trigger(args, name, unit)
+            if value < minimum:
+                sys.exit(f"ERROR: --{setting} must be at least {minimum}")
         model_provider(model)
         try:
             openhands_reasoning_effort(effort, model)
@@ -359,8 +388,14 @@ def role_model_config(args: Args, role: str) -> dict[str, str]:
         "SENPAI_OPENHANDS_FAST_REASONING_EFFORT": args.fast_reasoning_effort,
         "SENPAI_OPENHANDS_FRONTIER_MODEL": args.frontier_model,
         "SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT": args.frontier_reasoning_effort,
-        "SENPAI_COMPACTION_TRIGGER_TOKENS": str(args.compaction_trigger_tokens),
-        "SENPAI_COMPACTION_TRIGGER_EVENTS": str(args.compaction_trigger_events),
+        "SENPAI_COMPACTION_TRIGGER_TOKENS": str(
+            compaction_trigger(args, role, "tokens")[1]
+        ),
+        "SENPAI_COMPACTION_TRIGGER_EVENTS": str(
+            compaction_trigger(args, role, "events")[1]
+        ),
+        "SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS": str(args.compaction_trigger_tokens),
+        "SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS": str(args.compaction_trigger_events),
     }
     if "custom_openai" in role_model_providers(args, role):
         config.update(

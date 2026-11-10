@@ -497,7 +497,7 @@ detailed available summary. The standalone runner and launcher default to
 Claude Opus 5.5 at `xhigh` for advisors and `high` for students. Explicit
 GPT-5.6 profiles also accept `max`, which uses API `max` effort with Responses
 `reasoning.mode: pro`. Automatic OpenAI compaction starts at
-the `compaction_trigger_tokens` value from `senpai.yaml`, which defaults to
+the conversation's token trigger, described below, which defaults to
 200,000 rendered tokens. The OpenHands condenser is disabled for that provider
 chain, but its complete local event log remains durable and is used to recover
 the latest response ID after restart.
@@ -508,7 +508,7 @@ never adds the OpenAI-only `reasoning.mode: pro` request body to Anthropic
 calls.
 
 Direct Anthropic models use native server-side compaction with the same
-`compaction_trigger_tokens` input-token trigger. OpenHands persists the returned
+input-token trigger. OpenHands persists the returned
 typed compaction block in the normal event log and replays it first in each
 later request, including after a process restart. Anthropic performs the token
 count after provider rendering; Senpai does not load a local tokenizer. This
@@ -526,7 +526,21 @@ default. The view holds only LLM-convertible events, so hook executions do not
 count. Each condensation keeps the first four events and the most recent
 events that fit in half of whichever limit fired, the event window or the
 token cap. The same settings apply to agents built from markdown definitions,
-replacing the SDK's 80-event default, and to delegated children.
+replacing the SDK's 80-event default.
+
+Each conversation has one token trigger and one event trigger. The advisor's
+and each student's own conversation use `advisor_compaction_trigger_tokens`
+and `advisor_compaction_trigger_events`, or the `student_` equivalents, when
+set, and the shared `compaction_trigger_tokens` and `compaction_trigger_events`
+otherwise. The launcher writes the role's values to
+`SENPAI_COMPACTION_TRIGGER_TOKENS` and `SENPAI_COMPACTION_TRIGGER_EVENTS`, and
+the shared values to `SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS` and
+`SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS`. Conversations on the shared smart,
+fast, and frontier profiles use the child values: delegated children at every
+depth, the supervisor, and the merge code reviewer. Those profiles run the
+same models in every role, so a large trigger sized for the advisor's model
+never reaches a smaller helper model. A runner without the child variables
+gives its children its own trigger.
 
 The complete durable transcript remains available as plain event JSON under
 `$SENPAI_OPENHANDS_STATE_DIR/$SENPAI_CONVERSATION_ID/events/`. The harness
@@ -734,8 +748,8 @@ and current research base. It receives no advisor conversation history or
 parent-history directory. Its prompt includes the PR diff, which starts with a
 summary of every changed file, and the PR body with its newest issue comments,
 submitted reviews, and inline review comments. The embedded context holds as
-many characters as the compaction trigger has tokens, about a third of the
-usable window. Discussion gets a quarter of it and the diff the rest; the body
+many characters as the reviewer's child compaction trigger has tokens, about a
+third of the usable window. Discussion gets a quarter of it and the diff the rest; the body
 and each entry keep at most a quarter of the discussion share, older entries are
 omitted, and the reviewer inspects the rest of the snapshot with Git. Its system
 context includes the full target program as research-agent guidance, with a

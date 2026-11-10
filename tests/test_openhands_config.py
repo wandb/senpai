@@ -552,6 +552,57 @@ def test_compaction_trigger_events_reject_invalid_environment_values(
         resolve_config(parse_runner_args(["--max-turns", "1"]), env)
 
 
+def test_child_compaction_triggers_default_to_the_conversation_trigger(tmp_path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_COMPACTION_TRIGGER_TOKENS"] = "800000"
+    env["SENPAI_COMPACTION_TRIGGER_EVENTS"] = "500"
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+    assert config.child_compaction_trigger_tokens == 800_000
+    assert config.child_compaction_trigger_events == 500
+
+
+def test_children_supervisor_and_reviewer_use_the_child_compaction_trigger(tmp_path):
+    env = runtime_env(tmp_path)
+    env["SENPAI_COMPACTION_TRIGGER_TOKENS"] = "800000"
+    env["SENPAI_COMPACTION_TRIGGER_EVENTS"] = "500"
+    env["SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS"] = "160000"
+    env["SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS"] = "300"
+
+    config = resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+    delegated = runner.delegation_config(config)
+    supervisor = runner.supervisor_config(config)
+
+    assert config.compaction_trigger_tokens == 800_000
+    assert config.compaction_trigger_events == 500
+    assert delegated.compaction_trigger_tokens == 160_000
+    assert delegated.compaction_trigger_events == 300
+    assert supervisor.compaction_trigger_tokens == 160_000
+    assert supervisor.compaction_trigger_events == 300
+
+
+@pytest.mark.parametrize(
+    ("key", "value", "message"),
+    [
+        ("SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS", "lots", "an integer"),
+        ("SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS", "49999", "at least 50000"),
+        ("SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS", "11", "at least 12"),
+    ],
+)
+def test_child_compaction_triggers_reject_invalid_environment_values(
+    tmp_path,
+    key,
+    value,
+    message,
+):
+    env = runtime_env(tmp_path)
+    env[key] = value
+
+    with pytest.raises(RuntimeError, match=f"{key} must be {message}"):
+        resolve_config(parse_runner_args(["--max-turns", "1"]), env)
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [

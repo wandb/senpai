@@ -668,6 +668,58 @@ def test_role_model_configuration_preserves_the_configured_efforts():
         assert config["SENPAI_OPENHANDS_FRONTIER_REASONING_EFFORT"] == "max"
         assert config["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "180000"
         assert config["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "600"
+        assert config["SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS"] == "180000"
+        assert config["SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS"] == "600"
+
+
+def test_each_role_gets_its_own_compaction_trigger_and_children_the_shared_one():
+    args = launch_args(
+        compaction_trigger_tokens=160_000,
+        compaction_trigger_events=500,
+        advisor_compaction_trigger_tokens=800_000,
+        student_compaction_trigger_events=300,
+    )
+
+    advisor_config, _deployment, _secret = render_role("advisor", args)
+    student_config, _deployment, _secret = render_role("student", args)
+    advisor = yaml.safe_load(advisor_config)["data"]
+    student = yaml.safe_load(student_config)["data"]
+
+    assert advisor["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "800000"
+    assert advisor["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "500"
+    assert student["SENPAI_COMPACTION_TRIGGER_TOKENS"] == "160000"
+    assert student["SENPAI_COMPACTION_TRIGGER_EVENTS"] == "300"
+    for config in (advisor, student):
+        assert config["SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS"] == "160000"
+        assert config["SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS"] == "500"
+
+
+def test_role_compaction_triggers_parse_from_yaml_and_cli(monkeypatch, tmp_path):
+    config_path = tmp_path / "senpai.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "tag": "config-test",
+                "target_repo_url": "https://github.com/example/problem.git",
+                "compaction_trigger_tokens": 160_000,
+                "advisor_compaction_trigger_tokens": 800_000,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        sys, "argv", ["launch.py", "--student_compaction_trigger_events", "300"]
+    )
+
+    args = launch.sp.parse(launch.Args, config_path=str(config_path))
+
+    assert args.advisor_compaction_trigger_tokens == 800_000
+    assert args.advisor_compaction_trigger_events is None
+    assert args.student_compaction_trigger_tokens is None
+    assert args.student_compaction_trigger_events == 300
+    assert launch.compaction_trigger(args, "student", "tokens") == (
+        "compaction_trigger_tokens",
+        160_000,
+    )
 
 
 def test_students_receive_the_training_log_stall_interval_from_the_launch_config():
@@ -700,6 +752,26 @@ def test_launch_rejects_an_event_trigger_the_condenser_cannot_split():
 
     with pytest.raises(SystemExit, match="must be at least 12"):
         launch.validate_model_config(args)
+
+
+@pytest.mark.parametrize(
+    ("setting", "value", "message"),
+    [
+        ("advisor_compaction_trigger_tokens", 49_999, "at least 50000"),
+        ("advisor_compaction_trigger_events", 11, "at least 12"),
+        ("student_compaction_trigger_tokens", 49_999, "at least 50000"),
+        ("student_compaction_trigger_events", 11, "at least 12"),
+    ],
+)
+def test_launch_applies_the_compaction_minimums_to_each_role(setting, value, message):
+    with pytest.raises(SystemExit, match=f"--{setting} must be {message}"):
+        launch.validate_model_config(launch_args(**{setting: value}))
+
+
+def test_a_students_only_launch_ignores_the_advisor_compaction_trigger():
+    launch.validate_model_config(
+        launch_args(advisor=False, advisor_compaction_trigger_tokens=49_999)
+    )
 
 
 def custom_openai_launch_args(**overrides) -> launch.Args:
@@ -737,6 +809,47 @@ def test_launch_stays_quiet_when_the_token_trigger_leaves_headroom(capsys):
     )
 
     assert capsys.readouterr().err == ""
+
+
+def test_a_large_advisor_trigger_on_a_native_model_beside_custom_openai_students(
+    capsys,
+):
+    launch.validate_model_config(
+        custom_openai_launch_args(
+            advisor_model="openai/gpt-6-astra",
+            advisor_compaction_trigger_tokens=800_000,
+            frontier_model="openai/gpt-6-astra",
+            compaction_trigger_tokens=160_000,
+        )
+    )
+
+    assert capsys.readouterr().err == ""
+
+
+def test_the_warning_names_the_role_setting_a_custom_openai_role_uses(capsys):
+    launch.validate_model_config(
+        custom_openai_launch_args(
+            compaction_trigger_tokens=160_000,
+            student_compaction_trigger_tokens=200_000,
+        )
+    )
+
+    warning = capsys.readouterr().err
+    assert "WARNING: --student_compaction_trigger_tokens 200000" in warning
+    assert warning.count("WARNING:") == 1
+
+
+def test_custom_openai_children_are_checked_against_the_shared_trigger(capsys):
+    launch.validate_model_config(
+        custom_openai_launch_args(
+            compaction_trigger_tokens=200_000,
+            student_compaction_trigger_tokens=160_000,
+        )
+    )
+
+    warning = capsys.readouterr().err
+    assert "WARNING: --compaction_trigger_tokens 200000" in warning
+    assert "student_compaction_trigger_tokens" not in warning
 
 
 def test_openai_ultra_launch_value_is_rejected():

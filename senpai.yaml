@@ -64,6 +64,10 @@ frontier_reasoning_effort: max
 compaction_trigger_tokens: 200000
 # OpenHands condenser event trigger: compact past this many model-visible events.
 compaction_trigger_events: 400
+# Optional triggers for the advisor's or the students' own conversation. Unset
+# values use the shared triggers above, which child agents always use.
+# advisor_compaction_trigger_tokens: 600000
+# student_compaction_trigger_tokens: 160000
 # Self-hosted OpenAI-compatible endpoint for custom_openai/<served-model-id> profiles.
 # custom_openai_base_url: https://inference.example.ts.net/v1
 # custom_openai_context_tokens: 100000  # the server's --max-model-len

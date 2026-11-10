@@ -372,6 +372,31 @@ def test_unfinished_review_retries_once_with_a_compact_prompt(
         assert merge_case.fake.mutations == []
 
 
+def test_review_budgets_and_compacts_with_the_child_trigger(merge_case, monkeypatch):
+    # The reviewer runs on the smart profile, so a large trigger for the
+    # conversation that starts it must not size the reviewer's prompt.
+    merge_case.config = replace(
+        merge_case.config,
+        compaction_trigger_tokens=800_000,
+        child_compaction_trigger_tokens=60_000,
+    )
+    large_comment = "Earlier benchmark log. " + "y" * 20_000
+    merge_case.fake.comments.append(comment(2, large_comment))
+    reviews = []
+
+    def review(prompt, config, *, response_schema, on_structured_result):
+        reviews.append((prompt, config.compaction_trigger_tokens))
+        on_structured_result(APPROVED)
+        return 0
+
+    monkeypatch.setattr(runner, "run_openhands", review)
+
+    assert execute(merge_case)["state"] == "experiment_merged"
+    [(prompt, trigger_tokens)] = reviews
+    assert trigger_tokens == 60_000
+    assert large_comment not in prompt
+
+
 def test_non_blocking_notes_merge_and_are_published_with_the_approval(
     merge_case, monkeypatch,
 ):
