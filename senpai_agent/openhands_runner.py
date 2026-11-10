@@ -104,6 +104,7 @@ from senpai_agent.compaction import (
     DEFAULT_COMPACTION_TRIGGER_EVENTS,
     DEFAULT_COMPACTION_TRIGGER_TOKENS,
     MIN_COMPACTION_TRIGGER_EVENTS,
+    MIN_COMPACTION_TRIGGER_TOKENS,
 )
 from senpai_agent.exa_tool import configure_exa_credentials
 from senpai_agent.github.tools import (
@@ -236,6 +237,8 @@ class RunnerConfig:
     frontier_reasoning_effort: str
     compaction_trigger_tokens: int
     compaction_trigger_events: int
+    child_compaction_trigger_tokens: int
+    child_compaction_trigger_events: int
     workspace: Path
     state_dir: Path
     conversation_id: uuid.UUID
@@ -361,6 +364,24 @@ def env_value(
     default: str | None = None,
 ) -> str | None:
     return parsed_value if parsed_value is not None else env.get(key, default)
+
+
+def compaction_setting(
+    env: Mapping[str, str],
+    key: str,
+    parsed_value: int | None,
+    *,
+    default: int,
+    minimum: int,
+) -> int:
+    """One compaction trigger: the option, else the environment, else the default."""
+    try:
+        value = int(env.get(key, default) if parsed_value is None else parsed_value)
+    except ValueError as error:
+        raise RuntimeError(f"{key} must be an integer") from error
+    if value < minimum:
+        raise RuntimeError(f"{key} must be at least {minimum}")
+    return value
 
 
 def resolve_api_key(env: Mapping[str, str], key_env: str) -> SecretStr:
@@ -723,41 +744,37 @@ def resolve_config(
         raise RuntimeError("Senpai LLM timeout settings must be numeric") from error
     if llm_timeout_seconds <= 0 or llm_num_retries <= 0:
         raise RuntimeError("Senpai LLM timeout and attempts must be positive")
-    try:
-        compaction_trigger_tokens = int(
-            args.compaction_trigger_tokens
-            if args.compaction_trigger_tokens is not None
-            else env.get(
-                "SENPAI_COMPACTION_TRIGGER_TOKENS",
-                str(DEFAULT_COMPACTION_TRIGGER_TOKENS),
-            )
-        )
-    except ValueError as error:
-        raise RuntimeError(
-            "SENPAI_COMPACTION_TRIGGER_TOKENS must be an integer"
-        ) from error
-    if compaction_trigger_tokens < 50_000:
-        raise RuntimeError(
-            "SENPAI_COMPACTION_TRIGGER_TOKENS must be at least 50000"
-        )
-    try:
-        compaction_trigger_events = int(
-            args.compaction_trigger_events
-            if args.compaction_trigger_events is not None
-            else env.get(
-                "SENPAI_COMPACTION_TRIGGER_EVENTS",
-                str(DEFAULT_COMPACTION_TRIGGER_EVENTS),
-            )
-        )
-    except ValueError as error:
-        raise RuntimeError(
-            "SENPAI_COMPACTION_TRIGGER_EVENTS must be an integer"
-        ) from error
-    if compaction_trigger_events < MIN_COMPACTION_TRIGGER_EVENTS:
-        raise RuntimeError(
-            "SENPAI_COMPACTION_TRIGGER_EVENTS must be at least "
-            f"{MIN_COMPACTION_TRIGGER_EVENTS}"
-        )
+    compaction_trigger_tokens = compaction_setting(
+        env,
+        "SENPAI_COMPACTION_TRIGGER_TOKENS",
+        args.compaction_trigger_tokens,
+        default=DEFAULT_COMPACTION_TRIGGER_TOKENS,
+        minimum=MIN_COMPACTION_TRIGGER_TOKENS,
+    )
+    compaction_trigger_events = compaction_setting(
+        env,
+        "SENPAI_COMPACTION_TRIGGER_EVENTS",
+        args.compaction_trigger_events,
+        default=DEFAULT_COMPACTION_TRIGGER_EVENTS,
+        minimum=MIN_COMPACTION_TRIGGER_EVENTS,
+    )
+    # Conversations on the shared smart, fast and frontier profiles: delegated
+    # children, the supervisor and the code reviewer. Without a separate
+    # setting they compact like the conversation that starts them.
+    child_compaction_trigger_tokens = compaction_setting(
+        env,
+        "SENPAI_CHILD_COMPACTION_TRIGGER_TOKENS",
+        None,
+        default=compaction_trigger_tokens,
+        minimum=MIN_COMPACTION_TRIGGER_TOKENS,
+    )
+    child_compaction_trigger_events = compaction_setting(
+        env,
+        "SENPAI_CHILD_COMPACTION_TRIGGER_EVENTS",
+        None,
+        default=compaction_trigger_events,
+        minimum=MIN_COMPACTION_TRIGGER_EVENTS,
+    )
     try:
         inbox_max_stalled_attempts = int(
             env.get(
@@ -990,6 +1007,8 @@ def resolve_config(
         frontier_reasoning_effort=frontier_reasoning_effort,
         compaction_trigger_tokens=compaction_trigger_tokens,
         compaction_trigger_events=compaction_trigger_events,
+        child_compaction_trigger_tokens=child_compaction_trigger_tokens,
+        child_compaction_trigger_events=child_compaction_trigger_events,
         workspace=workspace,
         state_dir=state_dir,
         conversation_id=(
@@ -1429,6 +1448,8 @@ def supervisor_config(config: RunnerConfig) -> RunnerConfig:
         api_key_env=config.smart_api_key_env,
         api_key=config.smart_api_key,
         reasoning_effort=config.smart_reasoning_effort,
+        compaction_trigger_tokens=config.child_compaction_trigger_tokens,
+        compaction_trigger_events=config.child_compaction_trigger_events,
         github_token=None,
     )
 
@@ -1454,8 +1475,8 @@ def delegation_config(
         frontier_reasoning_effort=config.frontier_reasoning_effort,
         frontier_api_key_env=config.frontier_api_key_env,
         frontier_api_key=config.frontier_api_key.get_secret_value(),
-        compaction_trigger_tokens=config.compaction_trigger_tokens,
-        compaction_trigger_events=config.compaction_trigger_events,
+        compaction_trigger_tokens=config.child_compaction_trigger_tokens,
+        compaction_trigger_events=config.child_compaction_trigger_events,
         github_repo=config.github_repo,
         github_trusted_actor=config.github_trusted_actor,
         role_file=config.role_file,
@@ -1912,6 +1933,12 @@ def run_openhands[ResponseT: BaseModel](
                 "frontier_reasoning_effort": config.frontier_reasoning_effort,
                 "compaction_trigger_tokens": config.compaction_trigger_tokens,
                 "compaction_trigger_events": config.compaction_trigger_events,
+                "child_compaction_trigger_tokens": (
+                    config.child_compaction_trigger_tokens
+                ),
+                "child_compaction_trigger_events": (
+                    config.child_compaction_trigger_events
+                ),
                 "prompt_cache": (
                     prompt_cache_configuration(config.model)
                     or {"provider_default": True}

@@ -54,6 +54,8 @@ def runtime_config(tmp_path: Path, **updates) -> RunnerConfig:
         "frontier_reasoning_effort": "max",
         "compaction_trigger_tokens": 200_000,
         "compaction_trigger_events": 400,
+        "child_compaction_trigger_tokens": 200_000,
+        "child_compaction_trigger_events": 400,
         "workspace": tmp_path,
         "state_dir": tmp_path / "state",
         "conversation_id": uuid.uuid4(),
