@@ -89,8 +89,8 @@ def test_main_yaml_token_trigger_reaches_the_provider_request(tmp_path, model):
             COMPACTION_SUMMARY_PROMPT
         )
 
-    assert config.compaction_trigger_tokens == 200_000
-    assert trigger == 200_000
+    assert config.compaction_trigger_tokens == 600_000
+    assert trigger == 600_000
 
 
 def test_main_yaml_event_trigger_reaches_the_runner_config(tmp_path):

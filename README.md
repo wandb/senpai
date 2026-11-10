@@ -155,7 +155,7 @@ fast_model: anthropic/claude-sonnet-5
 fast_reasoning_effort: medium
 frontier_model: anthropic/claude-opus-5-5
 frontier_reasoning_effort: max
-compaction_trigger_tokens: 200000
+compaction_trigger_tokens: 600000
 compaction_trigger_events: 400
 
 pvc_claim_name: your-existing-pvc
@@ -193,19 +193,20 @@ Responses and preserves `low`, `medium`, `high`, `xhigh`, or `max`; Astra reject
 sampling parameters. Change the main and smart/fast/frontier profile models
 independently, retaining each profile's reasoning effort.
 
-`compaction_trigger_tokens` sets the compaction limit. OpenAI and Anthropic
-apply it natively for their models. Every other model, including `wandb/` and
-`custom_openai/` ones, uses the OpenHands summarizing condenser, which compacts
-when the counted input exceeds `compaction_trigger_tokens` (or the model's
-input limit, if that is smaller) or when the conversation view holds more than
-`compaction_trigger_events` events (default 400). The view holds what the model
-sees: the system prompt, messages, actions and observations; hook executions
-do not count. A condensation keeps the first four events and the most recent
-events that fit in half of whichever limit fired, the event window or the
-token cap. Set `compaction_trigger_tokens` below the model's input limit so
-LiteLLM's approximate token count has room to err, for example 160000 on a
-196,608-token input limit; the launcher warns when it is not below a
-`custom_openai/` endpoint's limit.
+`compaction_trigger_tokens` sets the compaction limit, 600000 by default. OpenAI
+and Anthropic apply it natively for their models. Every other model, including
+`wandb/` and `custom_openai/` ones, uses the OpenHands summarizing condenser,
+which compacts when the counted input exceeds `compaction_trigger_tokens` (or
+the model's input limit, if that is smaller) or when the conversation view
+holds more than `compaction_trigger_events` events (default 400). The view
+holds what the model sees: the system prompt, messages, actions and
+observations; hook executions do not count. A condensation keeps the first four
+events and the most recent events that fit in half of whichever limit fired,
+the event window or the token cap. The default suits the default Claude models'
+1,000,000-token input. Set `compaction_trigger_tokens` below a smaller model's
+input limit so LiteLLM's approximate token count has room to err, for example
+160000 on a 196,608-token input limit; the launcher warns when it is not below
+a `custom_openai/` endpoint's limit.
 
 The advisor and students can compact at different sizes.
 `advisor_compaction_trigger_tokens` and `student_compaction_trigger_tokens`, and
