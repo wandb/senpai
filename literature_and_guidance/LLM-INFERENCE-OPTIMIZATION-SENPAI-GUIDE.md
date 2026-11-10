@@ -25,6 +25,12 @@ June 19, 2026 research post that argues for treating speculation as a central
 inference optimization and as part of a continuous data, evaluation, and
 distillation flywheel.
 
+It also incorporates kernel-engineering lessons from the public repositories and
+write-ups of Open Kernel Challenge teams (Muse Spark Open, October and November
+2026), who optimized H200 decode kernels for a mixture-of-experts model: the
+experts layer, attention, BF16 projections, and a whole decode layer. The
+Evidence Appendix lists those sources at the commits that were read.
+
 ## Terms Used In This Guide
 
 - Large language model: a transformer-based language model served for text
@@ -403,6 +409,11 @@ system uses a ladder:
 The fast loop should catch obvious failures. The slow loop should prevent
 expensive false positives.
 
+For small speed deltas, the paired measurement should replicate the scorer's
+timing method and include a duplicate of the incumbent in every run, so the
+noise floor is measured each time rather than assumed. Engineering GPU Kernels
+For Decode describes the details that mattered in the Open Kernel Challenge.
+
 ### Make Negative Results Easy To Reuse
 
 The corpus contains many dead ends that are useful precisely because they were
@@ -421,6 +432,10 @@ made explicit:
 A negative result should state whether the idea failed because of quality,
 speed, implementation feasibility, hardware transfer, or measurement mismatch.
 Those are different failures with different follow-up actions.
+
+Make a refutation binding for the design it tested, and give it a reopen
+condition. Scope it narrowly: a different implementation of the same idea can
+still win, as public kernels repeatedly showed in the Open Kernel Challenge.
 
 ## A Warm-Start Playbook For A New Model
 
@@ -636,6 +651,9 @@ overhead. Moving the drafter to separate hardware can look appealing, but
 communication latency can erase the gain unless the workload and deployment
 topology are unusually favorable.
 
+For the measurement and engineering method behind the largest kernel gains in
+the Open Kernel Challenge, see Engineering GPU Kernels For Decode below.
+
 ### Phase 8: Compose Conservatively
 
 Do not add measured gains linearly without checking interactions. Quantization
@@ -651,6 +669,170 @@ Use a composition table with:
 - expected interactions,
 - the validity gates it depends on,
 - the smallest useful official benchmark to confirm transfer.
+
+## Engineering GPU Kernels For Decode
+
+At decode sizes most kernels are short, bandwidth- or issue-bound, and chained.
+What separates a fast kernel from a slow one is mostly fixed cost at its edges
+and noise in its measurement, not peak throughput. The public Open Kernel
+Challenge record shows the same sequence behind its largest measured gains, so
+work through these steps in order. The Evidence Appendix links each source.
+
+### Make The Local Measurement Agree With The Scorer
+
+Reproduce the scorer's timing method before trusting a delta: its warm-up calls,
+graph capture and replay, how it flushes the L2 cache before each timed replay,
+any fixed launch cost it subtracts, in-place input refills, memory placement,
+compiler version, and realistic routing or data distributions. The best local
+benches matched the official scorer within about 1 percent per shape, using 100
+routings per shape fitted to the scorer's own timings. Benches that skipped a
+detail chased phantom gains:
+
+- builds with separate weight copies read 3.6 percent apart from memory
+  placement alone,
+- five fixed routing seeds made one candidate read 3 µs faster when it was 6 µs
+  slower,
+- a write-based cache flush added 1–2.5 µs to small kernels, because the scorer
+  flushes by reading,
+- an older compiler serialized tensor-core instructions and made one kernel look
+  27 percent slower,
+- identical code moved 0.3–0.6 µs per shape between scorer runs on small
+  projection shapes, a standard deviation of about 3 percent.
+
+Put a duplicate of the incumbent in every timing run. Accept a change only when
+every candidate copy beats every control copy, or when its gain exceeds the
+largest difference between identical arms. Never select each case's best
+reading: in one team's data, each case's luckiest control reading, with no code
+change at all, looked like a 0.77 percent gain.
+
+Budget the measurement itself. In one team's runs, compiling took 37–53 percent
+of GPU time and timed repetitions only 0.6–1.5 percent. Compiling on CPU
+machines and keeping a bench server loaded on each GPU returns that time to
+experiments.
+
+### Census The Floors And Weight Them By Score
+
+For each kernel class, measure its floor, bytes over achievable bandwidth or
+instructions over issue rate, and its distance from it. Then convert
+microseconds to score. When the score is a geometric mean over shapes, a
+microsecond on a small, fast case can be worth many on a large one: one team's
+table valued a microsecond off one decode token as much as 15 off the largest
+verify shape. Put this table in every experiment brief, and skip ideas whose
+predicted saving is below a stated threshold.
+
+### Bound The Target Before Building
+
+Build skeletons that remove one cost: no compute, no dequantization, a bare data
+ring, or attention with no math. Inject known delays at each hop and measure how
+much the end-to-end time moves per nanosecond added; the slope shows which hops
+matter. Fit time against work items, such as active experts, to expose fixed
+costs before trusting a bytes-over-bandwidth model. These bounds are cheap, and
+they separate streaming time from edge time.
+
+### Find The Mechanism In The Profile And The Machine Code
+
+The large measured steps began with a specific mechanism read from a profile or
+from SASS:
+
+- an FP8 matrix instruction that SASS showed was emulated, at 1,083 cycles per
+  tile against 417 for the native instruction,
+- an integer pipe saturated by weight decoding, relieved by moving work to the
+  FMA pipe,
+- DRAM idle for the first 4.7 µs of a call, fixed by a faster start and an
+  earlier release of a held ring slot,
+- a never-taken trap branch that made the compiler treat copy operands as
+  divergent; writing it three ways moved cases by 0.5–1.1 percent.
+
+Read the SASS after every edit, not only before. Compiler scheduling moves loops
+by a few percent, sinks loads, drops register-allocation hints, and serializes
+tensor-core instructions after changes that look harmless. Check profiler
+attribution too: profile rows can include dependent-launch wait time.
+
+### Expect The Edges To Dominate At Decode Sizes
+
+Count round trips, cross-CTA hand-offs, graph nodes, kernel boundaries, and cold
+code. Teams measured these H200 costs:
+
+- a cross-SM flag hop: 1.4 µs idle, 6.3 µs while HBM is saturated,
+- a graph node: about 1.06 µs,
+- a kernel boundary: 0.51 µs with programmatic dependent launch and 0.77 µs
+  without in one team's layer; 2.6–2.9 µs even with it in another's kernels,
+- cold code: about 0.5–1 µs per KB of straight-line code on the critical path
+  after an L2 flush.
+
+The spread shows why each cost must be measured on the actual path. Late gains
+on a mature experts kernel came from the start and end of the call,
+single-arrival hand-offs, and deleted dead code, not from the streaming loop.
+
+### Chain Kernels With Programmatic Dependent Launch
+
+Prefer a chain of kernels linked by programmatic dependent launch to grid-wide
+synchronization inside one kernel or a megakernel. In one team's layer, folding
+stages into their neighbours to remove dependent-launch boundaries lost
+21–27 µs. Issue a small amount of independent work before the wait, and trigger
+dependents right after the producer's last weight issue; that placement was
+worth 0.9 percent of a layer in another team's file. When adopting a kernel into
+a chain, check that it carries the wait, the trigger, and the programmatic
+launch attribute. Move work into a kernel that is already waiting, not into the
+critical one.
+
+### Treat Bytes In Flight As A Budget
+
+Keep enough bytes in flight to hold the bandwidth plateau, and no more.
+Background traffic is not free: prefetching later stages into L2 cost one
+experts kernel 14–21 percent, and deeper rings and extra in-flight data lost
+wherever teams measured them. One team's weight streaming fit
+`T = 1.7 µs + bytes / 4.62 TB/s`, and no access pattern on real weights beat
+about 4.7 TB/s.
+
+### Cut Bytes And Instructions Losslessly
+
+When a kernel is bandwidth- or issue-bound, look for representations that carry
+the same values in fewer bytes or fewer instructions:
+
+- 12-bit BF16 weights with an exact outlier correction,
+- 6-bit block scales when the scales take few distinct values (33 per tensor in
+  one model, worth about 2 percent on the experts kernel at 32–256 tokens),
+- code permutations that let one load serve several decode steps (20.12 to 18.44
+  instructions per weight word in one experts kernel).
+
+Prove each one bit-exact by an exhaustive check over the real value space. An
+activation rewrite that looked exact algebraically was off by up to 13,810 BF16
+ulp, found by checking all 65,536 BF16 inputs.
+
+### Specialize Per Shape Class, But Tune In Context
+
+Build separate variants per shape class at compile time, select between them
+with a noise-resistant rule, and pick them by measuring inside the full chain.
+One team pinned its dense-kernel picks to winners measured in the whole layer,
+because its isolated tuner missed them. Ship changes as compile-time flags that
+are off by default and leave SASS identical when off, so parallel workers'
+changes stack and the default build stays the incumbent.
+
+### Build Structural Changes Cheaply And Do Not Trust Predicted Gains
+
+In one team's record, every structural redesign predicted to win had the wrong
+sign: 0 for 12. Price every added hop at its measured cost, build a skeleton of
+the new structure, and measure the endpoint before investing. Set a time-boxed
+kill gate at the start: one team's one-hour gates ended three ground-up
+rewrites, the best of which reached only 0.70x of the incumbent.
+
+### Compare Against The Best Known Implementation Early
+
+Run a per-shape side-by-side against the strongest public or upstream
+implementation as soon as one exists, and again whenever a new one appears, then
+build on the strongest base. One agent campaign found its own files faster on
+0 of 68 rows, and 43 of its refutations were contradicted by public files that
+implemented the same ideas differently. Several teams' largest single gains came
+from adopting a public base. Respect licenses and notices when adopting code.
+
+### Harden Correctness For Reruns And Held-Out Data
+
+Rankings may come from reruns on new inputs. Test overflow-prone inputs,
+thousands of queued graph replays per shape compared bit for bit, many token
+counts, and deadlock watchdogs. Check that each test can fail: one test ran 1/40
+of the calls it claimed and exited 0 while printing FAIL. Keep receipts that are
+never overwritten: run identifier, candidate hash, flags, and seeds.
 
 ## Transformer-Specific Research Categories
 
@@ -885,6 +1067,12 @@ to:
 - Prefer prompt-invariant levers for private stability.
 - Use downstream quality gates when perplexity is a weak proxy.
 - Use paired speed measurements for small deltas.
+- Replicate the scorer's timing method and keep a duplicate of the incumbent
+  in every kernel timing run.
+- Compare against the best public or upstream implementation early, per shape.
+- Put a score-per-microsecond table in every kernel experiment brief.
+- Tune and select kernels inside the full chain, not in isolation.
+- Read the SASS after every kernel edit.
 - Require launch preflight before spending scarce official benchmark runs.
 
 Avoid these habits:
@@ -897,6 +1085,8 @@ Avoid these habits:
 - stacking projected gains before measuring interactions,
 - retraining a speculator for transient traffic shifts without checking whether
   the workload is really a mixture of stable domains,
+- treating prefetching or deeper buffering as free,
+- ranking structural redesigns by predicted gain instead of building a skeleton,
 - leaving dead ends undocumented.
 
 ## Evidence Appendix
@@ -934,6 +1124,21 @@ External research evidence:
 | Source | Lesson |
 | --- | --- |
 | [Modal, "Speculation Is All You Need"](https://modal.com/blog/spec-is-all-u-need), June 19, 2026 | Speculative decoding should be modeled and trained as a first-class inference optimization. Acceptance length drives the numerator, roofline and drafter cost determine the realized speedup, custom speculators can be trained from application data, and adaptive speculators should follow real workload structure rather than noisy short-term drift. |
+
+Open Kernel Challenge evidence (public repositories, read on November 10, 2026,
+at the commits linked):
+
+| Source | Lesson |
+| --- | --- |
+| [gauravjain14, experts README](https://github.com/gauravjain14/muse-okc-submissions/blob/30a2bcfcee0f0f4b1a10043191a359c725c2f5e1/muse_moe_w4a16/README.md) and [dead ends](https://github.com/gauravjain14/muse-okc-submissions/blob/30a2bcfcee0f0f4b1a10043191a359c725c2f5e1/muse_moe_w4a16/dead_ends.md) | 100 routings fitted to the scorer matched it within about 1 percent per shape; identical builds with separate weight copies read 3.6 percent apart; L2 prefetch of later stages cost 14–21 percent; DRAM idled for the first 4.7 µs of a call until a faster start fixed it. |
+| [gauravjain14, attention dead ends](https://github.com/gauravjain14/muse-okc-submissions/blob/30a2bcfcee0f0f4b1a10043191a359c725c2f5e1/muse_attention_decode/dead_ends.md) and [worker brief](https://github.com/gauravjain14/muse-okc-submissions/blob/30a2bcfcee0f0f4b1a10043191a359c725c2f5e1/muse_attention_decode/01_fused_flat_splitkv_fp8/notes/WORKERS.md) | SASS showed an emulated FP8 matrix instruction (1,083 against 417 cycles per tile); cold code on the critical path cost about 0.5–1 µs per KB after the L2 flush. |
+| [gauravjain14, decode layer README](https://github.com/gauravjain14/muse-okc-submissions/blob/30a2bcfcee0f0f4b1a10043191a359c725c2f5e1/muse_decode_layer/README.md) | Each graph node cost about 1.06 µs of dependent-launch latency. |
+| [AshishKumar4, README](https://github.com/AshishKumar4/open-kernel-challenge/blob/103ca7b9a016e2e518b69213a1eee51aa74c9a5a/README.md) and [dead-end audit](https://github.com/AshishKumar4/open-kernel-challenge/blob/103ca7b9a016e2e518b69213a1eee51aa74c9a5a/notes/dead-audit.md) | Structural predictions were 0 for 12 on sign; folding stages to remove dependent-launch boundaries lost 21–27 µs; a kernel boundary cost 0.51 µs with dependent launch and 0.77 µs without; luckiest-control selection alone looked like +0.77 percent; timed repetitions were 0.6–1.5 percent of GPU time; an exact-looking activation rewrite was off by 13,810 BF16 ulp. |
+| [AshishKumar4, GPU theory notes](https://github.com/AshishKumar4/open-kernel-challenge/blob/103ca7b9a016e2e518b69213a1eee51aa74c9a5a/notes/gpu-theory.md) | One µs off decode-1 sliding attention was worth 15 µs off the largest verify shape. |
+| [keell0renz, LESSONS](https://github.com/keell0renz/muse-open-kernel-challenge/blob/890809cee421500b00126d084e81b338ef9181ab/LESSONS.md) and [layer file](https://github.com/keell0renz/muse-open-kernel-challenge/blob/890809cee421500b00126d084e81b338ef9181ab/kernels/muse_decode_layer.py) | A cross-SM flag hop cost 1.4 µs idle and 6.3 µs under saturated HBM; lossless 6-bit scales gave about +2 percent; triggering dependents after the last weight issue gave +0.9 percent; dense picks were pinned from whole-layer measurements. |
+| [alygg77, H200 measured facts](https://github.com/alygg77/okc-muse-spark-kernels/blob/6cae49a639ee6d14b929a5fd4a63c627f96d7dc0/docs/H200_MEASURED_FACTS.md) | A code permutation cut the decode loop from 20.12 to 18.44 instructions per weight word; identical arms define the noise floor. |
+| [PhilippMarquardt, OKC lessons](https://github.com/PhilippMarquardt/kernel-development/blob/cca338af158ebe8f878a7a8bd7bd7ecf85dc4e26/okc-challenge/LESSONS.md) and [design notes](https://github.com/PhilippMarquardt/kernel-development/blob/cca338af158ebe8f878a7a8bd7bd7ecf85dc4e26/docs/DESIGN.md) | A write flush added 1–2.5 µs; fixed routing seeds mis-ranked a candidate by 9 µs; an older compiler serialized tensor-core instructions; weight streaming fit 1.7 µs + bytes / 4.62 TB/s; kill gates ended three rewrites; a test exited 0 while printing FAIL. |
+| [yesthatwilly, methodology](https://github.com/yesthatwilly/open-kernel-challenge-2026/blob/fc740999a4c80015a00b2c050f1a1e787aaf623b/METHODOLOGY.md) | Its own files were faster than the public files on 0 of 68 rows, and 43 of its refutations were contradicted by them. |
 
 Corpus statistics:
 
