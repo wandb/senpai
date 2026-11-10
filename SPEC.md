@@ -498,7 +498,7 @@ Claude Opus 5.5 at `xhigh` for advisors and `high` for students. Explicit
 GPT-5.6 profiles also accept `max`, which uses API `max` effort with Responses
 `reasoning.mode: pro`. Automatic OpenAI compaction starts at
 the conversation's token trigger, described below, which defaults to
-200,000 rendered tokens. The OpenHands condenser is disabled for that provider
+600,000 rendered tokens. The OpenHands condenser is disabled for that provider
 chain, but its complete local event log remains durable and is used to recover
 the latest response ID after restart.
 

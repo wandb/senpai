@@ -331,7 +331,7 @@ def test_resolved_config_separates_runtime_credentials_from_conversation_secrets
     assert config.timeout_seconds == 7200
     assert config.llm_timeout_seconds == 5400
     assert config.llm_num_retries == 5
-    assert config.compaction_trigger_tokens == 200_000
+    assert config.compaction_trigger_tokens == 600_000
 
     delegated = runner.delegation_config(config)
     assert delegated.smart_api_key == "anthropic-key"
@@ -496,7 +496,7 @@ def test_compaction_trigger_tokens_are_explicit_and_configurable(tmp_path):
         runtime_env(tmp_path),
     )
 
-    assert default.compaction_trigger_tokens == 200_000
+    assert default.compaction_trigger_tokens == 600_000
     assert configured.compaction_trigger_tokens == 180_000
 
 

@@ -43,7 +43,7 @@ def test_default_config_exposes_every_model_profile_and_effort():
         "fast_reasoning_effort": "medium",
         "frontier_model": "anthropic/claude-opus-5-5",
         "frontier_reasoning_effort": "max",
-        "compaction_trigger_tokens": 200_000,
+        "compaction_trigger_tokens": 600_000,
         "compaction_trigger_events": 400,
     }.items() <= config.items()
     assert config["program_path"] == ""
@@ -793,7 +793,7 @@ def custom_openai_launch_args(**overrides) -> launch.Args:
 
 def test_launch_warns_when_the_token_trigger_is_not_below_the_input_limit(capsys):
     # The SDK caps the condenser's trigger at the 196,608-token input limit, so
-    # the default 200000 would leave no headroom for token-count error.
+    # a 200000 trigger would leave no headroom for token-count error.
     launch.validate_model_config(
         custom_openai_launch_args(compaction_trigger_tokens=200_000)
     )

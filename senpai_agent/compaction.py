@@ -6,7 +6,7 @@
 
 # Provider-native compaction (OpenAI stored Responses, Anthropic) and the
 # OpenHands summarizing condenser both start at this many input tokens.
-DEFAULT_COMPACTION_TRIGGER_TOKENS = 200_000
+DEFAULT_COMPACTION_TRIGGER_TOKENS = 600_000
 # Anthropic rejects a lower compaction threshold.
 MIN_COMPACTION_TRIGGER_TOKENS = 50_000
 # The OpenHands condenser also compacts when the conversation view holds more
