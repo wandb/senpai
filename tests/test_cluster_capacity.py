@@ -428,6 +428,7 @@ def test_blocked_publication_times_out_and_restores_process_timer(monkeypatch):
 
     api = SlowPublication()
     monkeypatch.setattr(capacity, "COLLECTION_SECONDS", 0.02)
+    monkeypatch.setattr(capacity, "PUBLICATION_SECONDS", 0.1)
     previous_handler = signal.getsignal(signal.SIGALRM)
     started = time.monotonic()
     with pytest.raises(TimeoutError, match="observation deadline"):

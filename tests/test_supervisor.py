@@ -855,7 +855,8 @@ def test_unavailable_health_port_discards_handoff_without_reading_it(
     assert not Path(environment["SENPAI_GITHUB_TOKEN_FILE"]).exists()
 
 
-def test_http_health_server_closes_idle_connections(tmp_path: Path):
+def test_http_health_server_closes_idle_connections(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(supervisor_module, "HEALTH_IDLE_SECONDS", 0.2)
     with serve_lease_health(
         tmp_path / "lease.json", host="127.0.0.1", port=0
     ) as server:
